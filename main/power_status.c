@@ -9,7 +9,8 @@
 #include "freertos/task.h"
 
 /* Second PI4IOE5V6408 (0x44), set up as M5Unified does for Tab5:
- * P5 nCHG_QC_EN (output, low selects the 1000 mA step, high 500 mA),
+ * P5 nCHG_QC_EN (output, low selects the 1000 mA step, high 500 mA; 500 mA is
+ *    used, so a laptop port can power the Tab5, the phone and the charger at once),
  * P6 IP2326 BAT_STAT (input; high while charging and while disabled),
  * P7 CHG_EN (output, high = charger on).
  * After reset every pin is high-Z with pull-down, so the charger stays off
@@ -123,7 +124,7 @@ esp_err_t tab5_power_init(void)
     if (s_expander) {
         esp_err_t err = esp_io_expander_set_dir(s_expander, POWER_CHG_STAT, IO_EXPANDER_INPUT);
         err |= esp_io_expander_set_dir(s_expander, POWER_CHG_QC, IO_EXPANDER_OUTPUT);
-        err |= esp_io_expander_set_level(s_expander, POWER_CHG_QC, 0);
+        err |= esp_io_expander_set_level(s_expander, POWER_CHG_QC, 1);
         err |= esp_io_expander_set_output_mode(s_expander, POWER_CHG_QC, IO_EXPANDER_OUTPUT_MODE_PUSH_PULL);
         err |= esp_io_expander_set_dir(s_expander, POWER_CHG_EN, IO_EXPANDER_OUTPUT);
         err |= esp_io_expander_set_level(s_expander, POWER_CHG_EN, 1);
