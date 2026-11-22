@@ -60,6 +60,7 @@ void app_main(void)
     ESP_ERROR_CHECK(tab5_session_init());
     ESP_ERROR_CHECK(ncm_host_init());
     ESP_ERROR_CHECK(tab5_usb_start());
+    tab5_audio_begin();
     if (xTaskCreate(usb_probe_task, "usb_probe", 6144, NULL, 8, NULL) != pdPASS) abort();
     cp_battery battery;
     cp_battery_init(&battery);

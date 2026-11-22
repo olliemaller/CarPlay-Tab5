@@ -2,6 +2,7 @@
 #include "core/pcm_buffer.h"
 #include "core/audio_resample.h"
 #include "echo_cancel.h"
+#include "board_io.h"
 #include "bsp/m5stack_tab5.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -57,6 +58,7 @@ static size_t mic_head, mic_count;
 static int mic_peak;
 static esp_codec_dev_handle_t speaker, microphone;
 static bool codec_open;
+static SemaphoreHandle_t begin_gate;
 static volatile int volume = SPEAKER_VOLUME_DEFAULT, applied_volume = -1;
 static volatile int mic_gain_db = MIC_GAIN_DEFAULT_DB, applied_mic_gain_db = -1;
 
@@ -86,8 +88,10 @@ static esp_err_t open_codecs(void)
                      (unsigned)CODEC_OPEN_DMA_RESERVE);
         return ESP_ERR_NO_MEM;
     }
+    tab5_board_io_lock();
     if (!speaker) speaker = bsp_audio_codec_speaker_init();
     if (!microphone) microphone = bsp_audio_codec_microphone_init();
+    tab5_board_io_unlock();
     esp_codec_dev_sample_info_t fmt = {.sample_rate = CP_AUDIO_RATE, .channel = 2, .bits_per_sample = 16};
     const esp_log_level_t i2s_level = quiet_i2s();
     const bool speaker_open = speaker && microphone && esp_codec_dev_open(speaker, &fmt) == ESP_CODEC_DEV_OK;
@@ -149,11 +153,11 @@ static void worker(void *arg)
 {
     (void)arg;
     const size_t block_bytes = CP_AUDIO_BLOCK_FRAMES * 2u * sizeof(int16_t);
-    int16_t *out = heap_caps_malloc(block_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    int16_t *in = heap_caps_malloc(block_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    int16_t *lane_block = heap_caps_malloc(block_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    int16_t *pcm = heap_caps_malloc((CP_AUDIO_BLOCK_FRAMES + 2u) * 4u, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    int32_t *mix = heap_caps_malloc(CP_AUDIO_BLOCK_FRAMES * 2u * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *out = heap_caps_malloc(block_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *in = heap_caps_malloc(block_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *lane_block = heap_caps_malloc(block_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *pcm = heap_caps_malloc((CP_AUDIO_BLOCK_FRAMES + 2u) * 4u, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int32_t *mix = heap_caps_malloc(CP_AUDIO_BLOCK_FRAMES * 2u * sizeof(int32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     mic48 = heap_caps_malloc(CP_AUDIO_BLOCK_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     speaker48 = heap_caps_malloc(CP_AUDIO_BLOCK_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     mic16 = heap_caps_malloc(TAB5_ECHO_BLOCK * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -163,6 +167,9 @@ static void worker(void *arg)
         vTaskDelete(NULL);
         return;
     }
+    /* Wait for start-up to finish: the codec setup changes IO expander pins that
+     * the display and USB set up at the same time. */
+    xSemaphoreTake(begin_gate, portMAX_DELAY);
     unsigned idle = 0, blocks = 0;
     bool muted = false;
     for (;;) {
@@ -180,8 +187,11 @@ static void worker(void *arg)
             if (muted) ESP_LOGI(TAG, "idle: speaker muted, codecs stay open");
         }
         if (want && muted) {
+            /* The amplifier enable shares an IO expander with USB power; make sure
+             * it is still on before sound is due. */
+            const esp_err_t amp = tab5_feature_enable(BSP_FEATURE_SPEAKER, true);
             muted = esp_codec_dev_set_out_mute(speaker, false) != ESP_CODEC_DEV_OK;
-            if (!muted) ESP_LOGI(TAG, "speaker unmuted");
+            if (!muted) ESP_LOGI(TAG, "speaker unmuted, amplifier %s", amp == ESP_OK ? "on" : esp_err_to_name(amp));
         }
         if (applied_volume != volume) {
             applied_volume = volume;
@@ -264,9 +274,10 @@ esp_err_t tab5_audio_init(void)
 {
     if (lock) return ESP_OK;
     lock = xSemaphoreCreateMutex();
+    begin_gate = xSemaphoreCreateBinary();
     mic_ring = heap_caps_calloc(MIC_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     mic_scratch = heap_caps_calloc(MIC_READ_MAX, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    bool ok = lock && mic_ring && mic_scratch;
+    bool ok = lock && begin_gate && mic_ring && mic_scratch;
     for (unsigned i = 0; ok && i < TAB5_AUDIO_LANES; ++i) {
         lanes[i].samples = heap_caps_calloc(LANE_MAX_FRAMES, 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         lanes[i].valid = heap_caps_calloc(LANE_MAX_FRAMES, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -277,6 +288,11 @@ esp_err_t tab5_audio_init(void)
     if (ok && xTaskCreate(worker, "pcm_play", 10240, NULL, 6, NULL) == pdPASS) return ESP_OK;
     ESP_LOGE(TAG, "init failed");
     return ESP_ERR_NO_MEM;
+}
+
+void tab5_audio_begin(void)
+{
+    if (begin_gate) xSemaphoreGive(begin_gate);
 }
 
 esp_err_t tab5_audio_start(unsigned lane, uint64_t generation, uint32_t rate, unsigned channels)

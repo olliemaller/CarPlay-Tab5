@@ -11,6 +11,8 @@ extern "C" {
  * alternate audio (navigation prompts). Every stream is resampled to 48 kHz. */
 #define TAB5_AUDIO_LANES 2
 esp_err_t tab5_audio_init(void);
+/* Lets the audio task open the codecs; call once the display and USB are up. */
+void tab5_audio_begin(void);
 esp_err_t tab5_audio_routes_init(void);
 /* Start replaces whatever the lane played before. Never called from the USB callback. */
 esp_err_t tab5_audio_start(unsigned lane,uint64_t generation,uint32_t rate,unsigned channels);

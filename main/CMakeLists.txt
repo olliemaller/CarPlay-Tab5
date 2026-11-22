@@ -14,6 +14,7 @@ idf_component_register(
         "app_main.c"
         "sd_log.c"
         "power_status.c"
+        "board_io.c"
         "app_session.c"
         "entropy_source.c"
         "airplay_service.c"
