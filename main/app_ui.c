@@ -11,6 +11,7 @@
 #include "airplay_software_provider.h"
 #include "airplay_control_port.h"
 #include "audio_output.h"
+#include "video_output.h"
 #include "pairing_reset.h"
 #include "esp_timer.h"
 #include "esp_app_desc.h"
@@ -50,7 +51,18 @@ static void *sink_context;
 #define VOLUME_DEFAULT 30
 #define BRIGHTNESS_DEFAULT 40
 #define BRIGHTNESS_MIN 10
-static lv_obj_t *settings,*volume_value,*brightness_value,*settings_battery;
+#define MIC_LEVEL_DEFAULT 72          /* 30 dB, the fixed gain before this setting */
+static const unsigned sharpen_levels[]={0,128,255};
+static const char *const sharpen_names[]={"Off","Normal","Strong",""};
+#define SHARPEN_DEFAULT 1
+static const unsigned picture_heights[]={240,360,576};
+static const char *const picture_names[]={"Smooth","Sharper","Sharpest",""};
+static const uint32_t screen_off_ms[]={0,60000,300000};
+static const char *const screen_off_names[]={"Never","1 min","5 min",""};
+static int brightness_now=40;     /* restored when the screen wakes */
+static unsigned screen_off_choice;
+static bool screen_off;
+static lv_obj_t *settings,*volume_value,*brightness_value,*mic_value,*settings_battery,*picture_note;
 static bool settings_open;
 /* Written under the LVGL lock, read by the video presenter for the overlay. */
 static volatile int battery_percent=-1;
@@ -247,14 +259,15 @@ static void show_percent(lv_obj_t *value_label,int percent)
 static void slider_event(lv_event_t *event)
 {
     lv_obj_t *slider=lv_event_get_target(event);
-    const bool is_volume=lv_event_get_user_data(event)!=NULL;
+    const intptr_t which=(intptr_t)lv_event_get_user_data(event);   /* 0 brightness, 1 volume, 2 microphone */
     const int value=lv_slider_get_value(slider);
     const lv_event_code_t code=lv_event_get_code(event);
     if(code==LV_EVENT_VALUE_CHANGED) {
-        if(is_volume) { tab5_audio_set_volume(value); show_percent(volume_value,value); }
-        else { bsp_display_brightness_set(value); show_percent(brightness_value,value); }
+        if(which==1) { tab5_audio_set_volume(value); show_percent(volume_value,value); }
+        else if(which==2) { tab5_mic_set_level(value); show_percent(mic_value,value); }
+        else { brightness_now=value; bsp_display_brightness_set(value); show_percent(brightness_value,value); }
     } else if(code==LV_EVENT_RELEASED) {
-        save_setting(is_volume?"volume":"brightness",value);   /* flash once per drag */
+        save_setting(which==1?"volume":which==2?"mic":"brightness",value);   /* flash once per drag */
     }
 }
 /* Right-hand drive moves the CarPlay dock to the right. The phone reads it when
@@ -282,6 +295,70 @@ static void drive_row(lv_obj_t *parent,int y,bool right)
     lv_obj_set_style_bg_color(toggle,lv_color_hex(UI_ACCENT),LV_PART_INDICATOR|LV_STATE_CHECKED);
     if(right) lv_obj_add_state(toggle,LV_STATE_CHECKED);
     lv_obj_add_event_cb(toggle,drive_event,LV_EVENT_VALUE_CHANGED,NULL);
+}
+/* One of a few fixed options, as a row of buttons. */
+static lv_obj_t *choice_row(lv_obj_t *parent,const char *name,int y,const char *const *names,unsigned selected,lv_event_cb_t callback)
+{
+    lv_obj_t *caption=lv_label_create(parent); lv_label_set_text(caption,name);
+    lv_obj_set_style_text_color(caption,lv_color_hex(UI_TEXT),0);
+    lv_obj_set_style_text_font(caption,&lv_font_montserrat_28,0);
+    lv_obj_set_pos(caption,96,y);
+    lv_obj_t *buttons=lv_buttonmatrix_create(parent);
+    lv_buttonmatrix_set_map(buttons,(const char **)names);
+    lv_buttonmatrix_set_button_ctrl_all(buttons,LV_BUTTONMATRIX_CTRL_CHECKABLE);
+    lv_buttonmatrix_set_one_checked(buttons,true);
+    if(selected<3) lv_buttonmatrix_set_button_ctrl(buttons,selected,LV_BUTTONMATRIX_CTRL_CHECKED);
+    lv_obj_set_size(buttons,width-192,72); lv_obj_set_pos(buttons,96,y+48);
+    lv_obj_set_style_bg_opa(buttons,LV_OPA_TRANSP,0); lv_obj_set_style_border_width(buttons,0,0);
+    lv_obj_set_style_pad_all(buttons,0,0);
+    lv_obj_set_style_bg_color(buttons,lv_color_hex(0x203040),LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(buttons,lv_color_hex(UI_ACCENT),LV_PART_ITEMS|LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(buttons,lv_color_hex(UI_TEXT),LV_PART_ITEMS);
+    lv_obj_set_style_text_color(buttons,lv_color_hex(UI_BG),LV_PART_ITEMS|LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(buttons,&lv_font_montserrat_28,LV_PART_ITEMS);
+    lv_obj_add_event_cb(buttons,callback,LV_EVENT_VALUE_CHANGED,NULL);
+    return buttons;
+}
+static unsigned chosen(lv_event_t *event) { return lv_buttonmatrix_get_selected_button(lv_event_get_target(event)); }
+static void picture_note_update(void)
+{
+    lv_label_set_text(picture_note,carplay_video_profile_did_fallback()?
+        "The last choice was too slow and fell back to the safe setting. Applies from the next connection.":
+        "Sharper is slower to move. Applies from the next connection.");
+}
+static void picture_event(lv_event_t *event)
+{
+    const unsigned choice=chosen(event);
+    if(choice>=3) return;
+    for(unsigned i=0;i<carplay_video_profile_count();++i)
+        if(carplay_video_profile_at(i)->height==picture_heights[choice]) { carplay_video_profile_select(i); break; }
+    picture_note_update();
+    ESP_LOGI("SETTINGS","picture=%s from the next connection",picture_names[choice]);
+}
+static void sharpen_event(lv_event_t *event)
+{
+    const unsigned choice=chosen(event);
+    if(choice>=3) return;
+    tab5_video_set_sharpening(sharpen_levels[choice]); save_setting("sharpen",(int)choice);
+}
+static void screen_off_event(lv_event_t *event)
+{
+    const unsigned choice=chosen(event);
+    if(choice>=3) return;
+    screen_off_choice=choice; save_setting("screen_off",(int)choice);
+}
+/* Waiting screen only: dark after the chosen idle time, back on at a touch or a phone. */
+static void screen_timer(lv_timer_t *timer)
+{
+    (void)timer;
+    const uint32_t limit=screen_off_ms[screen_off_choice];
+    const bool idle_screen=ui_stage==CP_DETACHED && !settings_open && !pair_dialog_open && !pair_busy && !shutting_down;
+    const uint32_t inactive=lv_display_get_inactive_time(display);
+    if(screen_off) {
+        if(!limit || !idle_screen || inactive<1000) { screen_off=false; bsp_display_brightness_set(brightness_now); }
+    } else if(limit && idle_screen && inactive>=limit) {
+        screen_off=true; bsp_display_brightness_set(0);
+    }
 }
 static void leave_video(void);
 static void close_settings(void)
@@ -314,7 +391,7 @@ static void settings_timer(lv_timer_t *timer)
     (void)timer;
     if(airplay_host_ui_take()) open_settings();
 }
-static lv_obj_t *settings_row(lv_obj_t *parent,const char *name,int y,int value,int low,lv_obj_t **value_label,bool is_volume)
+static lv_obj_t *settings_row(lv_obj_t *parent,const char *name,int y,int value,int low,lv_obj_t **value_label,intptr_t which)
 {
     lv_obj_t *caption=lv_label_create(parent); lv_label_set_text(caption,name);
     lv_obj_set_style_text_color(caption,lv_color_hex(UI_TEXT),0);
@@ -332,11 +409,11 @@ static lv_obj_t *settings_row(lv_obj_t *parent,const char *name,int y,int value,
     lv_obj_set_style_bg_color(slider,lv_color_hex(UI_ACCENT),LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(slider,lv_color_hex(UI_ACCENT),LV_PART_KNOB);
     lv_obj_set_style_pad_all(slider,12,LV_PART_KNOB);
-    lv_obj_add_event_cb(slider,slider_event,LV_EVENT_VALUE_CHANGED,is_volume?(void *)1:NULL);
-    lv_obj_add_event_cb(slider,slider_event,LV_EVENT_RELEASED,is_volume?(void *)1:NULL);
+    lv_obj_add_event_cb(slider,slider_event,LV_EVENT_VALUE_CHANGED,(void *)which);
+    lv_obj_add_event_cb(slider,slider_event,LV_EVENT_RELEASED,(void *)which);
     return slider;
 }
-static void build_settings(lv_obj_t *screen,int volume,int brightness,bool right_hand)
+static void build_settings(lv_obj_t *screen,int volume,int brightness,int mic,unsigned sharpen,bool right_hand)
 {
     settings=lv_obj_create(screen);
     lv_obj_remove_style_all(settings);
@@ -345,25 +422,43 @@ static void build_settings(lv_obj_t *screen,int volume,int brightness,bool right
     lv_obj_set_style_bg_opa(settings,LV_OPA_COVER,0);
     lv_obj_add_flag(settings,LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(settings,LV_OBJ_FLAG_SCROLLABLE);
+    /* Pinned header: title, battery, back. */
     lv_obj_t *heading=lv_label_create(settings); lv_label_set_text(heading,"Tab5 Settings");
     lv_obj_set_style_text_color(heading,lv_color_hex(UI_ACCENT),0);
     lv_obj_set_style_text_font(heading,&lv_font_montserrat_40,0);
-    lv_obj_set_pos(heading,96,64);
-    settings_battery=lv_label_create(settings); lv_label_set_text(settings_battery,"");
-    lv_obj_set_style_text_color(settings_battery,lv_color_hex(UI_MUTED),0);
-    lv_obj_set_style_text_font(settings_battery,&lv_font_montserrat_28,0);
-    lv_obj_align(settings_battery,LV_ALIGN_TOP_RIGHT,-96,76);
-    settings_row(settings,"Volume",200,volume,0,&volume_value,true);
-    settings_row(settings,"Brightness",340,brightness,BRIGHTNESS_MIN,&brightness_value,false);
-    drive_row(settings,470,right_hand);
+    lv_obj_set_pos(heading,96,48);
     lv_obj_t *back=lv_button_create(settings);
-    lv_obj_set_size(back,360,88); lv_obj_align(back,LV_ALIGN_BOTTOM_MID,0,-64);
+    lv_obj_set_size(back,320,72); lv_obj_align(back,LV_ALIGN_TOP_RIGHT,-96,40);
     lv_obj_set_style_bg_color(back,lv_color_hex(UI_ACCENT),0);
     lv_obj_t *text=lv_label_create(back); lv_label_set_text(text,LV_SYMBOL_LEFT "  Back to CarPlay");
     lv_obj_set_style_text_color(text,lv_color_hex(UI_BG),0);
     lv_obj_set_style_text_font(text,&lv_font_montserrat_28,0);
     lv_obj_center(text);
     lv_obj_add_event_cb(back,back_event,LV_EVENT_CLICKED,NULL);
+    settings_battery=lv_label_create(settings); lv_label_set_text(settings_battery,"");
+    lv_obj_set_style_text_color(settings_battery,lv_color_hex(UI_MUTED),0);
+    lv_obj_set_style_text_font(settings_battery,&lv_font_montserrat_28,0);
+    lv_obj_align(settings_battery,LV_ALIGN_TOP_RIGHT,-96-320-40,58);
+    /* Scrolling list below. */
+    lv_obj_t *list=lv_obj_create(settings);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list,width,height-144); lv_obj_set_pos(list,0,144);
+    lv_obj_set_scroll_dir(list,LV_DIR_VER);
+    lv_obj_set_style_pad_bottom(list,48,0);
+    int y=16;
+    settings_row(list,"Volume",y,volume,0,&volume_value,1); y+=140;
+    settings_row(list,"Brightness",y,brightness,BRIGHTNESS_MIN,&brightness_value,0); y+=140;
+    settings_row(list,"Microphone",y,mic,0,&mic_value,2); y+=150;
+    unsigned picture=3;
+    for(unsigned i=0;i<3;++i) if(carplay_video_profile_current()->height==picture_heights[i]) picture=i;
+    choice_row(list,"Picture",y,picture_names,picture,picture_event);
+    picture_note=lv_label_create(list);
+    lv_obj_set_style_text_color(picture_note,lv_color_hex(UI_MUTED),0);
+    lv_obj_set_pos(picture_note,96,y+128);
+    picture_note_update(); y+=180;
+    choice_row(list,"Picture sharpening",y,sharpen_names,sharpen,sharpen_event); y+=150;
+    choice_row(list,"Screen off when unplugged",y,screen_off_names,screen_off_choice,screen_off_event); y+=150;
+    drive_row(list,y,right_hand);
     lv_obj_add_flag(settings,LV_OBJ_FLAG_HIDDEN);
 }
 esp_err_t tab5_ui_init(void)
@@ -406,14 +501,22 @@ esp_err_t tab5_ui_init(void)
     const int volume=load_setting("volume",VOLUME_DEFAULT,0,100);
     const int brightness=load_setting("brightness",BRIGHTNESS_DEFAULT,BRIGHTNESS_MIN,100);
     const bool right_hand=load_setting("rhd",0,0,1)!=0;
+    const int mic=load_setting("mic",MIC_LEVEL_DEFAULT,0,100);
+    const unsigned sharpen=(unsigned)load_setting("sharpen",SHARPEN_DEFAULT,0,2);
+    screen_off_choice=(unsigned)load_setting("screen_off",0,0,2);
+    brightness_now=brightness;
     right_hand_ui=right_hand;
     tab5_audio_set_volume(volume);
+    tab5_mic_set_level(mic);
+    tab5_video_set_sharpening(sharpen_levels[sharpen]);
     airplay_software_provider_set_right_hand_drive(right_hand);
-    build_settings(screen,volume,brightness,right_hand);
+    build_settings(screen,volume,brightness,mic,sharpen,right_hand);
     build_pairing(screen);
     lv_timer_create(settings_timer,100,NULL);
     lv_timer_create(pairing_timer,100,NULL);
-    ESP_LOGI("SETTINGS","volume=%d brightness=%d right_hand_drive=%d",volume,brightness,right_hand);
+    lv_timer_create(screen_timer,1000,NULL);
+    ESP_LOGI("SETTINGS","volume=%d brightness=%d mic=%d sharpen=%u screen_off=%u right_hand_drive=%d",
+             volume,brightness,mic,sharpen,screen_off_choice,right_hand);
     ready=true;
     bsp_display_unlock(); return bsp_display_brightness_set(brightness);
 }

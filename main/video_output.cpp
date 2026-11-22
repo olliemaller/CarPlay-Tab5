@@ -32,7 +32,8 @@ struct FrameSlot { uint8_t *memory; unsigned width,height; uint64_t generation; 
 constexpr size_t slot_bytes=1280*720*3/2;
 // The panel stretches each row into several, so this restores some of the contrast
 // between rows. 128 is half of the difference from the rows around a pixel.
-constexpr unsigned sharpen_strength=128;
+std::atomic<unsigned> sharpen_strength{128};   // Settings: 0 off, 128 normal, 255 strong.
+std::atomic<bool> judge_begun{false};          // Cleared at each session start.
 FrameSlot slots[3];
 FrameSlot *filling=&slots[0],*showing=&slots[1],*ready=&slots[2];
 bool frame_ready;
@@ -68,16 +69,19 @@ void note_max(std::atomic<uint32_t> &slot,int64_t start_us) {
     if(ms>slot) slot=ms;
 }
 // More than one rejected frame in five means the profile outruns this board.
+// Counted from the trial's own first frame, not since boot.
 void judge_profile() {
     constexpr uint32_t window=100,limit=5;
-    static bool begun,trial;
-    if(!begun) { begun=true; trial=carplay_video_profile_begin(); }
+    static bool trial; static uint32_t base_submitted,base_rejected;
+    if(!judge_begun.exchange(true)) {
+        trial=carplay_video_profile_begin(); base_submitted=stats.submitted; base_rejected=stats.rejected;
+    }
     if(!trial) return;
-    const uint32_t submitted=stats.submitted;
+    const uint32_t submitted=stats.submitted-base_submitted,rejected=stats.rejected-base_rejected;
     if(submitted<window) return;
     trial=false;
-    if(uint64_t(stats.rejected)*limit>submitted) {
-        ESP_LOGW("VIDEO","Profile too slow: rej=%lu of %lu; next boot uses the safe profile",(unsigned long)stats.rejected,(unsigned long)submitted);
+    if(uint64_t(rejected)*limit>submitted) {
+        ESP_LOGW("VIDEO","Profile too slow: rej=%lu of %lu; the next session uses the safe profile",(unsigned long)rejected,(unsigned long)submitted);
         carplay_video_profile_fallback();
     } else carplay_video_profile_confirm();
 }
@@ -99,7 +103,7 @@ bool idr(const uint8_t *p,size_t size) {
 }
 bool pack_frame(FrameSlot &slot,const cp_i420 &frame,uint64_t stream) {
     const int64_t start=esp_timer_get_time();
-    if(!cp_i420_pack(&frame,slot.memory,slot_bytes,sharpen_strength)) return false;
+    if(!cp_i420_pack(&frame,slot.memory,slot_bytes,sharpen_strength.load(std::memory_order_relaxed))) return false;
     slot.width=frame.width; slot.height=frame.height; slot.generation=stream;
     stats.pack_total_ms+=uint32_t((esp_timer_get_time()-start)/1000);
     return true;
@@ -217,8 +221,10 @@ esp_err_t tab5_video_init(void) {
     free(storage); free(input); storage=input=nullptr; mutex=draw=nullptr; worker_task=nullptr;
     return ESP_ERR_NO_MEM;
 }
+void tab5_video_set_sharpening(unsigned strength) { sharpen_strength=strength>255?255:strength; }
 void tab5_video_start(uint64_t epoch) {
     if(!worker_task) return;
+    if(epoch) judge_begun=false;   // A new session may run a newly chosen profile as a trial.
     ++stats.starts;
     ESP_LOGI("VIDEO","START epoch=%llu clears canvas",(unsigned long long)epoch);
     xSemaphoreTake(draw,portMAX_DELAY);

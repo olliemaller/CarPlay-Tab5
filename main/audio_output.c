@@ -20,7 +20,9 @@
 #define MIC_RING_SAMPLES 9600u           /* 200 ms at 48 kHz mono */
 #define MIC_READ_MAX 2880u               /* 60 ms at 48 kHz */
 #define SPEAKER_VOLUME_DEFAULT 30
-#define MIC_GAIN_DB 30.0f
+#define MIC_GAIN_DEFAULT_DB 30
+#define MIC_GAIN_MIN_DB 12
+#define MIC_GAIN_MAX_DB 37                /* ES7210 tops out at 37.5 dB */
 #define DUCK_GAIN_Q8 77                  /* about 30 % */
 #define IDLE_CLOSE_BLOCKS 300u           /* close the codecs after 3 s of nothing */
 #define STATS_BLOCKS 300u
@@ -50,6 +52,7 @@ static int mic_peak;
 static esp_codec_dev_handle_t speaker, microphone;
 static bool codec_open;
 static volatile int volume = SPEAKER_VOLUME_DEFAULT, applied_volume = -1;
+static volatile int mic_gain_db = MIC_GAIN_DEFAULT_DB, applied_mic_gain_db = -1;
 
 static bool rate_supported(uint32_t rate)
 {
@@ -92,9 +95,10 @@ static esp_err_t open_codecs(void)
         esp_codec_dev_close(speaker);
         return ESP_FAIL;
     }
-    (void)esp_codec_dev_set_in_gain(microphone, MIC_GAIN_DB);
+    applied_mic_gain_db = mic_gain_db;
+    (void)esp_codec_dev_set_in_gain(microphone, (float)applied_mic_gain_db);
     codec_open = true;
-    ESP_LOGI(TAG, "codecs open: 48 kHz stereo duplex, volume=%d mic_gain=%.1f dB", applied_volume, (double)MIC_GAIN_DB);
+    ESP_LOGI(TAG, "codecs open: 48 kHz stereo duplex, volume=%d mic_gain=%d dB", applied_volume, applied_mic_gain_db);
     return ESP_OK;
 }
 
@@ -154,6 +158,10 @@ static void worker(void *arg)
         if (applied_volume != volume) {
             applied_volume = volume;
             (void)esp_codec_dev_set_out_vol(speaker, applied_volume);
+        }
+        if (applied_mic_gain_db != mic_gain_db) {
+            applied_mic_gain_db = mic_gain_db;
+            (void)esp_codec_dev_set_in_gain(microphone, (float)applied_mic_gain_db);
         }
         if (want) idle = 0;
 
@@ -314,6 +322,12 @@ void tab5_audio_set_volume(int percent)
 }
 
 int tab5_audio_volume(void) { return volume; }
+
+void tab5_mic_set_level(int percent)
+{
+    percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+    mic_gain_db = MIC_GAIN_MIN_DB + (MIC_GAIN_MAX_DB - MIC_GAIN_MIN_DB) * percent / 100;
+}
 
 void tab5_audio_duck(bool on)
 {

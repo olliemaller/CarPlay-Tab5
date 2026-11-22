@@ -30,6 +30,8 @@ void tab5_mic_stop(void);
 /* True while a phone call uses the microphone: its audio then passes through the
  * echo canceller (main/echo_cancel.h) with the speaker output as the reference. */
 void tab5_mic_call(bool active);
+/* Microphone level, 0-100 %: 12 to 37 dB of codec gain. 72 % is the old 30 dB. */
+void tab5_mic_set_level(int percent);
 /* Fills exactly `frames` samples at rate (8, 16, 24 or 48 kHz) or returns 0. */
 size_t tab5_mic_read(unsigned rate,int16_t *samples,size_t frames);
 #ifdef __cplusplus
