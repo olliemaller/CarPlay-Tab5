@@ -45,7 +45,7 @@ static int width,height;
 static cp_touch touch;
 static tab5_touch_sink sink;
 static void *sink_context;
-/* Local settings page, opened from the CarPlay "Tab5 设置" icon (requestUI).
+/* Local settings page, opened from the CarPlay "Tab5 Settings" icon (requestUI).
  * While it is open, video is not drawn and touches stay on Tab5. */
 #define SETTINGS_NAMESPACE "tab5_ui"
 #define VOLUME_DEFAULT 30

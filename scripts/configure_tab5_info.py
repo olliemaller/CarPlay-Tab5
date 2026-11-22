@@ -51,7 +51,7 @@ def normalize(d):
     # CarPlay home-screen icon; tapping it sends requestUI, which opens the
     # local settings page (volume, brightness).
     d['oemIconVisible'] = True
-    d['oemIconLabel'] = 'Tab5 设置'
+    d['oemIconLabel'] = 'Tab5 Settings'
     d['oemIcons'] = [dict(imageData=(ASSETS / 'oem_settings.png').read_bytes(),
                           widthPixels=128, heightPixels=128, prerendered=True)]
     return d

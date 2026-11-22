@@ -12,7 +12,7 @@ This is an independent experimental project, not Apple-certified. **The current 
 - 890×240 video targeting 16 fps, scaled by PPA to 1280×720; touch input. Sharper 1024×360 and 1024×576 modes trade frame rate for detail.
 - Music and navigation prompt mixing/ducking, microphone uplink and device-tested Siri.
 - Phone-call echo cancellation (ESP-SR or SpeexDSP, chosen at build time; see below).
-- Tab5 Settings, opened from the CarPlay “Tab5 设置” icon: volume, brightness, microphone level, picture quality, picture sharpening, screen off when unplugged and right-hand drive (CarPlay dock on the right). All persist.
+- Tab5 Settings, opened from the CarPlay “Tab5 Settings” icon: volume, brightness, microphone level, picture quality, picture sharpening, screen off when unplugged and right-hand drive (CarPlay dock on the right). All persist.
 - Battery level on the waiting screen and in Settings, a low-battery icon over CarPlay, and a warned, automatic power-off when the pack is empty.
 - **Clear pairing** on the waiting screen, with confirmation and disconnected-session checks. Clears phone trust records and AirPlay pairings, nothing else.
 - USB channel error handling, TX/RX stall detection, port power-cycle recovery and an independent 15-second progress guard.
