@@ -21,6 +21,7 @@ idf_component_register(
         "core/ncm_descriptor.c"
         "app_ui.c"
         "pairing_reset.c"
+        "pair_store.c"
         "video_output.cpp"
         "audio_output.c"
         "audio_routes.c"
