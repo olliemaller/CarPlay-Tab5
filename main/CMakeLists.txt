@@ -57,7 +57,7 @@ idf_component_register(
         "esp_mm"
 )
 
-# Runs on every video frame; the project default is -Og.
+# Runs on every video frame. Kept explicit in case the project level changes.
 set_source_files_properties(core/pixel_convert.c PROPERTIES COMPILE_OPTIONS "-O2")
 
 # app_ui.c takes the panel handle that the BSP does not expose.
