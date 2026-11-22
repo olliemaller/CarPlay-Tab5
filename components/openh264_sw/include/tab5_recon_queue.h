@@ -31,6 +31,10 @@ typedef struct {
     unsigned long long reader_us;    // Reader work on the helper task.
     unsigned long long wait_us;      // Worker time spent waiting for the helper.
     unsigned long waits;             // Waits because a picture was still being read.
+    unsigned long long parse_wait_us; // Worker idle, waiting for parsing to get ahead.
+    unsigned long long stage_wait_us; // Parsing idle, waiting for the worker to free a stage.
+    unsigned long long deblock_us;   // Deblocking, part of recon_us.
+    unsigned long long expand_us;    // Border expansion, part of recon_us.
 } tab5_recon_stats_t;
 void tab5_recon_get_stats(tab5_recon_stats_t *stats);
 #ifdef __cplusplus

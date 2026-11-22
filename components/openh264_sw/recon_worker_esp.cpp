@@ -67,7 +67,7 @@ struct Reader {
   uint8_t uiPayload[TAB5_RECON_PAYLOAD_BYTES];
   std::atomic<const uint8_t*> pBusy{nullptr};
 } sReader;
-std::atomic<uint64_t> sReconUs{0}, sReaderUs{0}, sWaitUs{0};
+std::atomic<uint64_t> sReconUs{0}, sReaderUs{0}, sWaitUs{0}, sParseWaitUs{0}, sStageWaitUs{0}, sDeblockUs{0}, sExpandUs{0};
 std::atomic<uint32_t> sWaits{0};
 
 void ReaderTask (void*) {
@@ -152,7 +152,9 @@ void ReconTask (void*) {
         ExpandReferencingPicture (sJob.pPicture->pData, sJob.pPicture->iWidthInPixel, sJob.pPicture->iHeightInPixel,
                                   sJob.pPicture->iLinesize, sJob.pCtx->sExpandPicFunc.pfExpandLumaPicture,
                                   sJob.pCtx->sExpandPicFunc.pfExpandChromaPicture);
-        sReconUs.fetch_add (uint64_t (esp_timer_get_time() - iStart), std::memory_order_relaxed);
+        const uint64_t uiSpent = uint64_t (esp_timer_get_time() - iStart);
+        sReconUs.fetch_add (uiSpent, std::memory_order_relaxed);
+        sExpandUs.fetch_add (uiSpent, std::memory_order_relaxed);
       }
       break;
     case kJobWork:
@@ -258,7 +260,9 @@ void Tab5ReconBegin (PWelsDecoderContext pCtx) {
   }
   Stage& sStage = sStages[sNextStage];
   sNextStage = (sNextStage + 1) % kStages;
+  const int64_t iFreeStart = esp_timer_get_time();
   xSemaphoreTake (sStage.hFree, portMAX_DELAY);
+  sStageWaitUs.fetch_add (uint64_t (esp_timer_get_time() - iFreeStart), std::memory_order_relaxed);
   memcpy (sStage.pLayer, pLayer, sizeof (SDqLayer));
   CopyContext (sStage.pContext, pCtx);
   sStage.pContext->pCurDqLayer = sStage.pLayer;
@@ -290,8 +294,18 @@ bool Tab5ReconWait (PWelsDecoderContext pCtx, int32_t iMbIndex, int32_t iSerialT
       return true;
     if (bFinished)
       return false;
+    const int64_t iStart = esp_timer_get_time();
     ulTaskNotifyTake (pdTRUE, portMAX_DELAY);
+    sParseWaitUs.fetch_add (uint64_t (esp_timer_get_time() - iStart), std::memory_order_relaxed);
   }
+}
+
+int64_t Tab5ReconClock() {
+  return esp_timer_get_time();
+}
+
+void Tab5ReconDeblocked (int64_t iStartUs) {
+  sDeblockUs.fetch_add (uint64_t (esp_timer_get_time() - iStartUs), std::memory_order_relaxed);
 }
 
 void Tab5ReconSettle (PWelsDecoderContext pCtx) {
@@ -401,6 +415,10 @@ void tab5_recon_get_stats (tab5_recon_stats_t* pStats) {
   pStats->reader_us = sReaderUs.load (std::memory_order_relaxed);
   pStats->wait_us = sWaitUs.load (std::memory_order_relaxed);
   pStats->waits = sWaits.load (std::memory_order_relaxed);
+  pStats->parse_wait_us = sParseWaitUs.load (std::memory_order_relaxed);
+  pStats->stage_wait_us = sStageWaitUs.load (std::memory_order_relaxed);
+  pStats->deblock_us = sDeblockUs.load (std::memory_order_relaxed);
+  pStats->expand_us = sExpandUs.load (std::memory_order_relaxed);
 }
 
 void tab5_recon_drain (void) {

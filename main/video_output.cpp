@@ -56,8 +56,9 @@ void log_stats() {
     seen=total; seen_starts=starts; last=now;
     tab5_recon_stats_t recon={};
     tab5_recon_get_stats(&recon);
-    ESP_LOGI("VIDEO","RECON recon_total=%llums reader_total=%llums reader_wait=%llums picture_waits=%lu",
-        recon.recon_us/1000,recon.reader_us/1000,recon.wait_us/1000,recon.waits);
+    ESP_LOGI("VIDEO","RECON recon_total=%llums reader_total=%llums reader_wait=%llums picture_waits=%lu parse_wait=%llums stage_wait=%llums deblock=%llums expand=%llums",
+        recon.recon_us/1000,recon.reader_us/1000,recon.wait_us/1000,recon.waits,
+        recon.parse_wait_us/1000,recon.stage_wait_us/1000,recon.deblock_us/1000,recon.expand_us/1000);
     ESP_LOGI("VIDEO","STATS sub=%lu idr=%lu busy=%lu rej=%lu dec=%lu pend=%lu err=%lu ui_fail=%lu starts=%lu decoders=%lu skip=%lu pack_total=%lums decode_max=%lums decode_total=%lums ui_max=%lums ui_total=%lums size=%lux%lu",
         (unsigned long)stats.submitted,(unsigned long)stats.idr,(unsigned long)stats.busy,(unsigned long)stats.rejected,
         (unsigned long)stats.decoded,(unsigned long)stats.pending,(unsigned long)stats.errors,(unsigned long)stats.ui_failed,
