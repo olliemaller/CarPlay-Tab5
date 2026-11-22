@@ -27,6 +27,9 @@ void tab5_audio_duck(bool ducked);
 /* Microphone: reference counted; samples are 48 kHz mono averaged from both mics. */
 esp_err_t tab5_mic_start(void);
 void tab5_mic_stop(void);
+/* True while a phone call uses the microphone: its audio then passes through the
+ * echo canceller (main/echo_cancel.h) with the speaker output as the reference. */
+void tab5_mic_call(bool active);
 /* Fills exactly `frames` samples at rate (8, 16, 24 or 48 kHz) or returns 0. */
 size_t tab5_mic_read(unsigned rate,int16_t *samples,size_t frames);
 #ifdef __cplusplus

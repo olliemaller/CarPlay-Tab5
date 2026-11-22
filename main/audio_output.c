@@ -1,6 +1,7 @@
 #include "audio_output.h"
 #include "core/pcm_buffer.h"
 #include "core/audio_resample.h"
+#include "echo_cancel.h"
 #include "bsp/m5stack_tab5.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -38,6 +39,11 @@ static lane_t lanes[TAB5_AUDIO_LANES];
 static SemaphoreHandle_t lock;
 static volatile bool ducked;
 static int mic_users;
+static volatile bool call_active;
+/* 10 ms of 48 kHz mono, and the same at the echo canceller's 16 kHz. */
+static int16_t mic48[CP_AUDIO_BLOCK_FRAMES], speaker48[CP_AUDIO_BLOCK_FRAMES];
+static int16_t mic16[TAB5_ECHO_BLOCK], speaker16[TAB5_ECHO_BLOCK];
+_Static_assert(CP_AUDIO_BLOCK_FRAMES == TAB5_ECHO_BLOCK * (CP_AUDIO_RATE / TAB5_ECHO_RATE), "10 ms blocks");
 static int16_t *mic_ring, *mic_scratch;
 static size_t mic_head, mic_count;
 static int mic_peak;
@@ -172,10 +178,27 @@ static void worker(void *arg)
             ESP_LOGE(TAG, "microphone read failed; reopening");
             close_codecs(); vTaskDelay(pdMS_TO_TICKS(100)); continue;
         }
+        /* The echo canceller is opened and closed here, on its only caller. */
+        if (call_active && !tab5_echo_active() && !tab5_echo_open()) call_active = false;
+        if (!call_active && tab5_echo_active()) tab5_echo_close();
+        for (unsigned k = 0; k < CP_AUDIO_BLOCK_FRAMES; ++k)
+            mic48[k] = (int16_t)(((int32_t)in[2 * k] + in[2 * k + 1]) / 2);
+        if (tab5_echo_active()) {
+            /* What was just sent to the amplifier is the echo reference. Work at
+             * 16 kHz, then hold each sample for three 48 kHz slots, so readers
+             * decimating to 16 or 8 kHz get the cleaned samples back exactly. */
+            const unsigned factor = CP_AUDIO_RATE / TAB5_ECHO_RATE;
+            for (unsigned k = 0; k < CP_AUDIO_BLOCK_FRAMES; ++k)
+                speaker48[k] = (int16_t)(((int32_t)out[2 * k] + out[2 * k + 1]) / 2);
+            cp_decimate_mono(mic48, TAB5_ECHO_BLOCK, TAB5_ECHO_RATE, mic16);
+            cp_decimate_mono(speaker48, TAB5_ECHO_BLOCK, TAB5_ECHO_RATE, speaker16);
+            tab5_echo_process(mic16, speaker16, mic16);
+            for (unsigned k = 0; k < CP_AUDIO_BLOCK_FRAMES; ++k) mic48[k] = mic16[k / factor];
+        }
         xSemaphoreTake(lock, portMAX_DELAY);
         if (mic_users > 0) {
             for (unsigned k = 0; k < CP_AUDIO_BLOCK_FRAMES; ++k) {
-                const int16_t s = (int16_t)(((int32_t)in[2 * k] + in[2 * k + 1]) / 2);
+                const int16_t s = mic48[k];
                 const int a = s < 0 ? -s : s;
                 if (a > mic_peak) mic_peak = a;
                 mic_ring[mic_head] = s;
@@ -215,7 +238,7 @@ esp_err_t tab5_audio_init(void)
             cp_pcm_init(&lanes[i].pcm, lanes[i].samples, lanes[i].valid, LANE_MAX_FRAMES, CP_AUDIO_RATE, 2,
                         CP_AUDIO_RATE * PREROLL_MS / 1000u);
     }
-    if (ok && xTaskCreate(worker, "pcm_play", 6144, NULL, 6, NULL) == pdPASS) return ESP_OK;
+    if (ok && xTaskCreate(worker, "pcm_play", 12288, NULL, 6, NULL) == pdPASS) return ESP_OK;
     ESP_LOGE(TAG, "init failed");
     return ESP_ERR_NO_MEM;
 }
@@ -307,6 +330,13 @@ esp_err_t tab5_mic_start(void)
     xSemaphoreGive(lock);
     ESP_LOGI(TAG, "mic start users=%d", users);
     return ESP_OK;
+}
+
+void tab5_mic_call(bool active)
+{
+    if (call_active != active) ESP_LOGI(TAG, "call %s: echo cancellation %s (%s)", active ? "started" : "ended",
+                                        active ? "requested" : "off", tab5_echo_engine());
+    call_active = active;
 }
 
 void tab5_mic_stop(void)

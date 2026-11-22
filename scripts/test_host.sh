@@ -10,6 +10,18 @@ mkdir -p artifacts
 ./artifacts/test_airplay_pairing_store
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g -Imain main/core/battery.c tests/test_battery.c -o artifacts/test_battery
 ./artifacts/test_battery
+for frame in 100 128 160 256 512; do
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g -DTAB5_ECHO_HOST_FRAME=$frame -Imain main/echo_cancel.c tests/test_echo_cancel.c -lm -o artifacts/test_echo_bridge
+    ./artifacts/test_echo_bridge
+done
+mkdir -p artifacts/speexdsp
+(cd artifacts/speexdsp && "${CC:-cc}" -std=c11 -O1 -w -fsanitize=address,undefined -g -DFLOATING_POINT -DUSE_KISS_FFT -DEXPORT= \
+    -I../../components/speexdsp/include -I../../components/speexdsp/libspeexdsp \
+    -c ../../components/speexdsp/libspeexdsp/mdf.c ../../components/speexdsp/libspeexdsp/preprocess.c \
+    ../../components/speexdsp/libspeexdsp/filterbank.c ../../components/speexdsp/libspeexdsp/fftwrap.c \
+    ../../components/speexdsp/libspeexdsp/kiss_fft.c ../../components/speexdsp/libspeexdsp/kiss_fftr.c)
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g -DTAB5_ECHO_HOST_SPEEX -Imain -Icomponents/speexdsp/include main/echo_cancel.c tests/test_echo_cancel.c artifacts/speexdsp/*.o -lm -o artifacts/test_echo_speex
+./artifacts/test_echo_speex
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g -Itests/usb_hal_stubs -Itests/stubs main/usb_hal_fix.c tests/test_usb_hal_fix.c -o artifacts/test_usb_hal_fix
 ./artifacts/test_usb_hal_fix
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g -Imain main/usb_descriptors.c tests/test_usb_descriptors.c -o artifacts/test_usb_descriptors
