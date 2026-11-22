@@ -24,7 +24,7 @@ namespace {
 // Lock order: draw, mutex.
 SemaphoreHandle_t mutex,draw,room;   // room: given whenever the worker takes a frame
 // Hold an arriving frame while this many are already waiting, for at most this long.
-constexpr unsigned kHoldUnits=3;
+constexpr unsigned kHoldUnits=2;   // fewer queued frames, less touch lag
 constexpr int64_t kHoldUs=250000;
 TaskHandle_t worker_task,presenter_task;
 // Decoding and display run in parallel on the two cores. Three slots rotate

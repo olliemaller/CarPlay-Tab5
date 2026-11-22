@@ -19,9 +19,12 @@ constexpr UBaseType_t kPriority = 4;   // The same as the decoder task.
 constexpr uint32_t kStackBytes = 12288;
 constexpr uint32_t kStages = 2;        // The frame being finished and the one being parsed.
 constexpr UBaseType_t kJobs = 8;       // Three per frame: reconstruct, expand, deliver.
-// Copying a finished frame out reads only that picture, so it runs beside parsing
-// on the other core while this one reconstructs the next frame.
-constexpr BaseType_t kReaderCore = 1;
+// Copying a finished frame out reads only that picture, so it can run beside
+// reconstruction. Measured on the Tab5 at 890x240: parsing takes about 44 ms a
+// frame on core 1 and reconstruction about 39 ms on core 0, which also waits for
+// parsing; the 14 ms copy fits in that slack on core 0, while on core 1 it made
+// parsing the bottleneck.
+constexpr BaseType_t kReaderCore = 0;
 constexpr uint32_t kReaderStackBytes = 4096;
 
 // One reconstruction, from the copy of the state that it needs.
