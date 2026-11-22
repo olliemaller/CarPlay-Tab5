@@ -24,7 +24,13 @@
 #define MIC_GAIN_MIN_DB 12
 #define MIC_GAIN_MAX_DB 37                /* ES7210 tops out at 37.5 dB */
 #define DUCK_GAIN_Q8 77                  /* about 30 % */
-#define IDLE_CLOSE_BLOCKS 300u           /* close the codecs after 3 s of nothing */
+#define IDLE_MUTE_BLOCKS 300u            /* mute the speaker after 3 s of nothing */
+/* Opening the codecs reconfigures I2S, which allocates DMA descriptors and buffers in
+ * internal DMA memory. While CarPlay streams that memory runs short, and if the
+ * allocation fails esp_codec_dev enables the channel anyway and the driver faults.
+ * So the codecs open once, at start-up, and stay open; a reopen after an I/O error
+ * is attempted only with this much DMA memory free in one block. */
+#define CODEC_OPEN_DMA_RESERVE 16384u
 #define STATS_BLOCKS 300u
 
 typedef struct {
@@ -42,9 +48,9 @@ static SemaphoreHandle_t lock;
 static volatile bool ducked;
 static int mic_users;
 static volatile bool call_active;
-/* 10 ms of 48 kHz mono, and the same at the echo canceller's 16 kHz. */
-static int16_t mic48[CP_AUDIO_BLOCK_FRAMES], speaker48[CP_AUDIO_BLOCK_FRAMES];
-static int16_t mic16[TAB5_ECHO_BLOCK], speaker16[TAB5_ECHO_BLOCK];
+/* 10 ms of 48 kHz mono, and the same at the echo canceller's 16 kHz. In PSRAM:
+ * internal RAM is kept for DMA. */
+static int16_t *mic48, *speaker48, *mic16, *speaker16;
 _Static_assert(CP_AUDIO_BLOCK_FRAMES == TAB5_ECHO_BLOCK * (CP_AUDIO_RATE / TAB5_ECHO_RATE), "10 ms blocks");
 static int16_t *mic_ring, *mic_scratch;
 static size_t mic_head, mic_count;
@@ -72,6 +78,14 @@ static esp_log_level_t quiet_i2s(void)
 
 static esp_err_t open_codecs(void)
 {
+    const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (dma_largest < CODEC_OPEN_DMA_RESERVE) {
+        static unsigned refused;
+        if (refused++ % 30u == 0)
+            ESP_LOGE(TAG, "not opening codecs: largest free DMA block %u < %u bytes", (unsigned)dma_largest,
+                     (unsigned)CODEC_OPEN_DMA_RESERVE);
+        return ESP_ERR_NO_MEM;
+    }
     if (!speaker) speaker = bsp_audio_codec_speaker_init();
     if (!microphone) microphone = bsp_audio_codec_microphone_init();
     esp_codec_dev_sample_info_t fmt = {.sample_rate = CP_AUDIO_RATE, .channel = 2, .bits_per_sample = 16};
@@ -107,7 +121,7 @@ static void close_codecs(void)
     esp_codec_dev_close(microphone);
     esp_codec_dev_close(speaker);
     codec_open = false;
-    ESP_LOGI(TAG, "codecs closed (idle)");
+    ESP_LOGI(TAG, "codecs closed after an I/O error");
 }
 
 static bool wanted_locked(void)
@@ -140,21 +154,35 @@ static void worker(void *arg)
     int16_t *lane_block = heap_caps_malloc(block_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     int16_t *pcm = heap_caps_malloc((CP_AUDIO_BLOCK_FRAMES + 2u) * 4u, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     int32_t *mix = heap_caps_malloc(CP_AUDIO_BLOCK_FRAMES * 2u * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!out || !in || !lane_block || !pcm || !mix) {
+    mic48 = heap_caps_malloc(CP_AUDIO_BLOCK_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    speaker48 = heap_caps_malloc(CP_AUDIO_BLOCK_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    mic16 = heap_caps_malloc(TAB5_ECHO_BLOCK * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    speaker16 = heap_caps_malloc(TAB5_ECHO_BLOCK * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!out || !in || !lane_block || !pcm || !mix || !mic48 || !speaker48 || !mic16 || !speaker16) {
         ESP_LOGE(TAG, "worker buffers unavailable");
         vTaskDelete(NULL);
         return;
     }
     unsigned idle = 0, blocks = 0;
+    bool muted = false;
     for (;;) {
         xSemaphoreTake(lock, portMAX_DELAY);
         const bool want = wanted_locked();
         xSemaphoreGive(lock);
         if (!codec_open) {
-            if (!want || open_codecs() != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(want ? 1000 : 20)); continue; }
-            idle = 0;
+            /* At start-up, and after an I/O error. Silence is written while idle,
+             * so the I2S clock keeps pacing this loop. */
+            if (open_codecs() != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+            idle = 0; muted = false;
         }
-        if (!want && ++idle > IDLE_CLOSE_BLOCKS) { close_codecs(); continue; }
+        if (!want && ++idle > IDLE_MUTE_BLOCKS && !muted) {
+            muted = esp_codec_dev_set_out_mute(speaker, true) == ESP_CODEC_DEV_OK;
+            if (muted) ESP_LOGI(TAG, "idle: speaker muted, codecs stay open");
+        }
+        if (want && muted) {
+            muted = esp_codec_dev_set_out_mute(speaker, false) != ESP_CODEC_DEV_OK;
+            if (!muted) ESP_LOGI(TAG, "speaker unmuted");
+        }
         if (applied_volume != volume) {
             applied_volume = volume;
             (void)esp_codec_dev_set_out_vol(speaker, applied_volume);
@@ -246,7 +274,7 @@ esp_err_t tab5_audio_init(void)
             cp_pcm_init(&lanes[i].pcm, lanes[i].samples, lanes[i].valid, LANE_MAX_FRAMES, CP_AUDIO_RATE, 2,
                         CP_AUDIO_RATE * PREROLL_MS / 1000u);
     }
-    if (ok && xTaskCreate(worker, "pcm_play", 12288, NULL, 6, NULL) == pdPASS) return ESP_OK;
+    if (ok && xTaskCreate(worker, "pcm_play", 10240, NULL, 6, NULL) == pdPASS) return ESP_OK;
     ESP_LOGE(TAG, "init failed");
     return ESP_ERR_NO_MEM;
 }

@@ -5,6 +5,7 @@ idf_component_register(
     SRCS "libspeexdsp/mdf.c" "libspeexdsp/preprocess.c" "libspeexdsp/filterbank.c"
          "libspeexdsp/fftwrap.c" "libspeexdsp/kiss_fft.c" "libspeexdsp/kiss_fftr.c"
     INCLUDE_DIRS "include"
-    PRIV_INCLUDE_DIRS "libspeexdsp")
+    PRIV_INCLUDE_DIRS "libspeexdsp"
+    PRIV_REQUIRES heap)
 target_compile_definitions(${COMPONENT_LIB} PRIVATE FLOATING_POINT USE_KISS_FFT EXPORT=)
-target_compile_options(${COMPONENT_LIB} PRIVATE -O2 -Wno-unused-variable -Wno-unused-but-set-variable -Wno-sign-compare -Wno-shift-negative-value)
+target_compile_options(${COMPONENT_LIB} PRIVATE "-include${CMAKE_CURRENT_LIST_DIR}/speex_alloc_psram.h" -O2 -Wno-unused-variable -Wno-unused-but-set-variable -Wno-sign-compare -Wno-shift-negative-value)

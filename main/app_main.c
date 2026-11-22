@@ -67,7 +67,10 @@ void app_main(void)
         battery_step(&battery);
         if (tick % 12 == 0) tab5_power_log();
         if (tick % 2 == 0)
-            ESP_LOGI(TAG, "heap_internal=%u psram=%u min_heap=%u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            ESP_LOGI(TAG, "heap_internal=%u dma_free=%u dma_largest=%u psram=%u min_heap=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)esp_get_minimum_free_heap_size());
         vTaskDelay(pdMS_TO_TICKS(BATTERY_PERIOD_MS));
     }
