@@ -252,21 +252,37 @@ static void worker(void *arg)
                 if (mic_count < MIC_RING_SAMPLES) ++mic_count;
             }
         }
-        if (++blocks >= STATS_BLOCKS) {
+        /* Copied under the lock, printed after it: a log line can block on the
+         * serial port, and the network task waits on this lock. */
+        struct { bool active; unsigned rate, channels, queued_ms; unsigned long long underruns, rejected, rebuffers;
+                 unsigned long reanchors, lock_misses, faster, slower; } snap[TAB5_AUDIO_LANES];
+        int mic_snap_users = 0, mic_snap_peak = 0; unsigned mic_snap_ms = 0;
+        const bool report = ++blocks >= STATS_BLOCKS;
+        if (report) {
             blocks = 0;
             for (unsigned i = 0; i < TAB5_AUDIO_LANES; ++i) {
-                lane_t *l = &lanes[i];
+                const lane_t *l = &lanes[i];
+                snap[i].active = l->active;
                 if (!l->active) continue;
-                ESP_LOGI(TAG, "STATS lane=%u rate=%u ch=%u queued_ms=%u underrun_frames=%llu rejected=%llu rebuffers=%llu reanchors=%lu lock_misses=%lu faster=%lu slower=%lu ducked=%d",
-                    i, l->rate, l->channels, (unsigned)(l->pcm.queued * 1000u / l->rate),
-                    (unsigned long long)l->pcm.underrun_frames, (unsigned long long)l->pcm.rejected_packets, (unsigned long long)l->pcm.rebuffer_count,
-                    (unsigned long)l->reanchors, (unsigned long)l->lock_misses,
-                    (unsigned long)l->faster, (unsigned long)l->slower, ducked);
+                snap[i].rate = l->rate; snap[i].channels = l->channels;
+                snap[i].queued_ms = (unsigned)(l->pcm.queued * 1000u / l->rate);
+                snap[i].underruns = l->pcm.underrun_frames; snap[i].rejected = l->pcm.rejected_packets;
+                snap[i].rebuffers = l->pcm.rebuffer_count; snap[i].reanchors = l->reanchors;
+                snap[i].lock_misses = l->lock_misses; snap[i].faster = l->faster; snap[i].slower = l->slower;
             }
-            if (mic_users > 0) ESP_LOGI(TAG, "STATS mic users=%d peak=%d buffered_ms=%u", mic_users, mic_peak, (unsigned)(mic_count / 48u));
+            mic_snap_users = mic_users; mic_snap_peak = mic_peak; mic_snap_ms = (unsigned)(mic_count / 48u);
             mic_peak = 0;
         }
         xSemaphoreGive(lock);
+        if (report) {
+            for (unsigned i = 0; i < TAB5_AUDIO_LANES; ++i) {
+                if (!snap[i].active) continue;
+                ESP_LOGI(TAG, "STATS lane=%u rate=%u ch=%u queued_ms=%u underrun_frames=%llu rejected=%llu rebuffers=%llu reanchors=%lu lock_misses=%lu faster=%lu slower=%lu ducked=%d",
+                    i, snap[i].rate, snap[i].channels, snap[i].queued_ms, snap[i].underruns, snap[i].rejected, snap[i].rebuffers,
+                    snap[i].reanchors, snap[i].lock_misses, snap[i].faster, snap[i].slower, ducked);
+            }
+            if (mic_snap_users > 0) ESP_LOGI(TAG, "STATS mic users=%d peak=%d buffered_ms=%u", mic_snap_users, mic_snap_peak, mic_snap_ms);
+        }
     }
 }
 
@@ -347,7 +363,9 @@ bool tab5_audio_submit(unsigned lane, uint64_t generation, uint32_t timestamp, c
 {
     if (!lock || lane >= TAB5_AUDIO_LANES) return false;
     lane_t *l = &lanes[lane];
-    if (xSemaphoreTake(lock, pdMS_TO_TICKS(5)) != pdTRUE) { ++l->lock_misses; return false; }
+    /* A short wait: the playout task holds the lock only briefly, but can be
+     * delayed by flash writes and heavy screen drawing. */
+    if (xSemaphoreTake(lock, pdMS_TO_TICKS(20)) != pdTRUE) { ++l->lock_misses; return false; }
     bool ok = l->active && l->generation == generation && cp_pcm_push(&l->pcm, generation, timestamp, data, bytes, big);
     if (!ok && l->active && l->generation == generation && l->pcm.queued == 0) {
         /* After a pause the phone's timestamps no longer match the playout

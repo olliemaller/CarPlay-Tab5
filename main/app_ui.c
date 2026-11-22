@@ -63,7 +63,6 @@ static int brightness_now=40;     /* restored when the screen wakes */
 static unsigned screen_off_choice;
 static bool screen_off;
 static lv_obj_t *settings,*volume_value,*brightness_value,*mic_value,*settings_battery,*picture_note;
-static bool settings_open;
 /* Written under the LVGL lock, read by the video presenter for the overlay. */
 static volatile int battery_percent=-1;
 static volatile bool battery_charging,battery_low,shutting_down,right_hand_ui;
@@ -82,13 +81,34 @@ static int load_setting(const char *key,int fallback,int low,int high)
     esp_err_t e=nvs_get_u8(h,key,&value); nvs_close(h);
     return e==ESP_OK && value>=low && value<=high ? value : fallback;
 }
-static void save_setting(const char *key,int value)
+/* Writing flash stalls both cores for tens of milliseconds, long enough to break
+ * up the music. While the Settings page is open, changes are kept here and
+ * written once when it closes. */
+static const char *const setting_keys[]={"volume","brightness","mic","sharpen","screen_off","rhd"};
+#define SETTING_COUNT (sizeof(setting_keys)/sizeof(setting_keys[0]))
+static int pending_settings[SETTING_COUNT];
+static bool pending_flags[SETTING_COUNT];
+static int pending_picture=-1;
+static bool settings_open;
+static void write_setting(const char *key,int value)
 {
     nvs_handle_t h;
     if(nvs_open(SETTINGS_NAMESPACE,NVS_READWRITE,&h)!=ESP_OK) return;
     if(nvs_set_u8(h,key,(uint8_t)value)==ESP_OK) nvs_commit(h);
     nvs_close(h);
     ESP_LOGI("SETTINGS","saved %s=%d",key,value);
+}
+static void save_setting(const char *key,int value)
+{
+    for(unsigned i=0;settings_open && i<SETTING_COUNT;++i)
+        if(!strcmp(setting_keys[i],key)) { pending_settings[i]=value; pending_flags[i]=true; return; }
+    write_setting(key,value);
+}
+static void flush_settings(void)
+{
+    for(unsigned i=0;i<SETTING_COUNT;++i)
+        if(pending_flags[i]) { pending_flags[i]=false; write_setting(setting_keys[i],pending_settings[i]); }
+    if(pending_picture>=0) { carplay_video_profile_select((unsigned)pending_picture); pending_picture=-1; }
 }
 static void touch_callback(lv_event_t *event)
 {
@@ -331,7 +351,10 @@ static void picture_event(lv_event_t *event)
     const unsigned choice=chosen(event);
     if(choice>=3) return;
     for(unsigned i=0;i<carplay_video_profile_count();++i)
-        if(carplay_video_profile_at(i)->height==picture_heights[choice]) { carplay_video_profile_select(i); break; }
+        if(carplay_video_profile_at(i)->height==picture_heights[choice]) {
+            if(settings_open) pending_picture=(int)i; else carplay_video_profile_select(i);
+            break;
+        }
     picture_note_update();
     ESP_LOGI("SETTINGS","picture=%s from the next connection",picture_names[choice]);
 }
@@ -365,6 +388,7 @@ static void close_settings(void)
 {
     if(!settings_open) return;
     settings_open=false;
+    flush_settings();
     tab5_video_pause(false);
     lv_obj_add_flag(settings,LV_OBJ_FLAG_HIDDEN);
     /* CarPlay sends frames only when its screen changes; ask for a full one so
@@ -587,7 +611,7 @@ void tab5_ui_status(cp_stage stage,cp_error error)
     else lv_obj_remove_flag(brand,LV_OBJ_FLAG_HIDDEN);
     if(stage!=CP_STREAMING) {
         deliver(cp_touch_cancel(&touch)); memset(&touch,0,sizeof(touch));
-        if(settings_open) { settings_open=false; lv_obj_add_flag(settings,LV_OBJ_FLAG_HIDDEN); }
+        if(settings_open) { settings_open=false; flush_settings(); lv_obj_add_flag(settings,LV_OBJ_FLAG_HIDDEN); }
         leave_video();
     }
     pair_refresh();
@@ -676,7 +700,7 @@ void tab5_ui_power_off_notice(void)
     if(!ready || !bsp_display_lock(1000)) return;
     shutting_down=true;
     deliver(cp_touch_cancel(&touch)); memset(&touch,0,sizeof(touch));
-    if(settings_open) { settings_open=false; lv_obj_add_flag(settings,LV_OBJ_FLAG_HIDDEN); }
+    if(settings_open) { settings_open=false; flush_settings(); lv_obj_add_flag(settings,LV_OBJ_FLAG_HIDDEN); }
     pair_close(); lv_obj_add_flag(pair_button,LV_OBJ_FLAG_HIDDEN);
     leave_video();
     lv_obj_remove_flag(brand,LV_OBJ_FLAG_HIDDEN);

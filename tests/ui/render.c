@@ -171,7 +171,7 @@ int main(void) {
     /* Picture and sharpening choices reach their owners. */
     lv_obj_t *matrix=find_matrix(screen,"Sharpest");assert(matrix);
     lv_buttonmatrix_set_selected_button(matrix,2);lv_obj_send_event(matrix,LV_EVENT_VALUE_CHANGED,NULL);
-    assert(profile_selected==3);
+    assert(profile_selected!=3);                            /* Saved when Settings closes. */
     matrix=find_matrix(screen,"Strong");assert(matrix);
     lv_buttonmatrix_set_selected_button(matrix,2);lv_obj_send_event(matrix,LV_EVENT_VALUE_CHANGED,NULL);
     assert(sharpening==255);
@@ -183,6 +183,7 @@ int main(void) {
     save("artifacts/ui-settings.ppm");
     click(button(screen,LV_SYMBOL_LEFT "  Back to CarPlay"));
     assert(!video_paused);
+    assert(profile_selected==3);
     /* Low battery: the waiting screen says so, and a small icon is drawn over the
      * video on the side away from the dock (left, as right-hand drive is now on). */
     tab5_ui_battery(9,false,true);tick(120);
