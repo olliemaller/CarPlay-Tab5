@@ -60,6 +60,8 @@ const carplay_video_profile_t *carplay_video_profile_at(unsigned i) { return i<4
 esp_err_t carplay_video_profile_select(unsigned i) { profile_selected=i; return ESP_OK; }
 bool carplay_video_profile_did_fallback(void) { return false; }
 void tab5_video_set_sharpening(unsigned s) { sharpening=(int)s; }
+static int video_paused;
+void tab5_video_pause(bool p) { video_paused=p; }
 void tab5_mic_set_level(int p) { mic_level=p; }
 const char *esp_err_to_name(esp_err_t e) { (void)e;return "stub"; }
 esp_err_t nvs_flash_init(void) { return ESP_OK; }
@@ -162,6 +164,7 @@ int main(void) {
     /* Settings page from CarPlay: the drive-side switch reaches the provider. */
     settings_requested=true;tick(200);
     assert(find_text(screen,"Right-hand drive"));
+    assert(video_paused);                                   /* Video waits behind Settings. */
     lv_obj_t *toggle=find_switch(screen);assert(toggle);
     lv_obj_add_state(toggle,LV_STATE_CHECKED);lv_obj_send_event(toggle,LV_EVENT_VALUE_CHANGED,NULL);tick(120);
     assert(right_hand_value==1);
@@ -179,6 +182,7 @@ int main(void) {
     assert(find_text(screen,"Charging 72%"));
     save("artifacts/ui-settings.ppm");
     click(button(screen,LV_SYMBOL_LEFT "  Back to CarPlay"));
+    assert(!video_paused);
     /* Low battery: the waiting screen says so, and a small icon is drawn over the
      * video on the side away from the dock (left, as right-hand drive is now on). */
     tab5_ui_battery(9,false,true);tick(120);

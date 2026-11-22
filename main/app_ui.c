@@ -365,6 +365,7 @@ static void close_settings(void)
 {
     if(!settings_open) return;
     settings_open=false;
+    tab5_video_pause(false);
     lv_obj_add_flag(settings,LV_OBJ_FLAG_HIDDEN);
     /* CarPlay sends frames only when its screen changes; ask for a full one so
      * the video comes back at once. The next frame re-enters video mode. */
@@ -380,6 +381,7 @@ static void open_settings(void)
     if(settings_open) return;
     deliver(cp_touch_cancel(&touch));
     settings_open=true;
+    tab5_video_pause(true);
     leave_video();
     lv_obj_remove_flag(settings,LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(settings);
@@ -616,7 +618,9 @@ static void draw_low_battery(void *framebuffer,int percent)
 }
 bool tab5_ui_frame(const uint8_t *data,unsigned frame_width,unsigned frame_height)
 {
-    if(!ready || !data || !bsp_display_lock(1000)) return false;
+    if(!ready || !data) return false;
+    if(settings_open) return true;
+    if(!bsp_display_lock(1000)) return false;
     const bool resized=frame_width!=touch.video_width || frame_height!=touch.video_height;
     if(resized) {
         deliver(cp_touch_cancel(&touch));

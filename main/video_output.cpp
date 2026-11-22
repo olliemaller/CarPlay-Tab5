@@ -235,8 +235,17 @@ void tab5_video_start(uint64_t epoch) {
     xTaskNotifyGive(worker_task);
 }
 void tab5_video_stop(void) { tab5_video_start(0); }
+std::atomic<bool> paused{false};
+void tab5_video_pause(bool value) {
+    const bool was=paused.exchange(value);
+    if(was && !value) {
+        // Frames were dropped: start again from a keyframe.
+        portENTER_CRITICAL(&loss_lock); lost=true; portEXIT_CRITICAL(&loss_lock);
+    }
+}
 bool tab5_video_submit(uint64_t epoch,const uint8_t *data,size_t size,uint64_t pts) {
     if(!worker_task || !data || !size || size>512*1024) return false;
+    if(paused.load(std::memory_order_relaxed)) return true;
     bool key=idr(data,size);
     ++stats.submitted; if(key) ++stats.idr;
     if(xSemaphoreTake(mutex,pdMS_TO_TICKS(5))!=pdTRUE) { ++stats.busy; mark_loss(epoch); xTaskNotifyGive(worker_task); return false; }
