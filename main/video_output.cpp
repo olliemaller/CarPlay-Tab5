@@ -12,6 +12,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "soc/soc.h"
+#include "tab5_recon_queue.h"
 #include <atomic>
 #include <stdlib.h>
 #include <utility>
@@ -52,6 +53,10 @@ void log_stats() {
     const int64_t now=esp_timer_get_time();
     if((total==seen && starts==seen_starts) || now-last<1000000) return;
     seen=total; seen_starts=starts; last=now;
+    tab5_recon_stats_t recon={};
+    tab5_recon_get_stats(&recon);
+    ESP_LOGI("VIDEO","RECON recon_total=%llums reader_total=%llums reader_wait=%llums picture_waits=%lu",
+        recon.recon_us/1000,recon.reader_us/1000,recon.wait_us/1000,recon.waits);
     ESP_LOGI("VIDEO","STATS sub=%lu idr=%lu busy=%lu rej=%lu dec=%lu pend=%lu err=%lu ui_fail=%lu starts=%lu decoders=%lu skip=%lu pack_total=%lums decode_max=%lums decode_total=%lums ui_max=%lums ui_total=%lums size=%lux%lu",
         (unsigned long)stats.submitted,(unsigned long)stats.idr,(unsigned long)stats.busy,(unsigned long)stats.rejected,
         (unsigned long)stats.decoded,(unsigned long)stats.pending,(unsigned long)stats.errors,(unsigned long)stats.ui_failed,
@@ -102,8 +107,9 @@ bool pack_frame(FrameSlot &slot,const cp_i420 &frame,uint64_t stream) {
 // The stream of the current decoder. Set while no decoder exists, so that no frame
 // is on its way here.
 uint64_t sink_stream;
-// Runs on the reconstruction task, which alone owns the filling slot and decodes
-// nothing until this returns, so the time spent here limits the frame rate.
+// Runs on the decoder's reader task, on the parsing core, one frame at a time and
+// in order, so it alone owns the filling slot. Reconstruction of the next frame
+// continues meanwhile; parsing shares this core.
 void on_frame(const cp_i420 *frame,void *) {
     const bool copied=pack_frame(*filling,*frame,sink_stream);
     xSemaphoreTake(mutex,portMAX_DELAY);

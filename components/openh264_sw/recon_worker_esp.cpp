@@ -2,6 +2,7 @@
 #include "recon_worker_esp.h"
 #include "decode_slice.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -18,6 +19,10 @@ constexpr UBaseType_t kPriority = 4;   // The same as the decoder task.
 constexpr uint32_t kStackBytes = 12288;
 constexpr uint32_t kStages = 2;        // The frame being finished and the one being parsed.
 constexpr UBaseType_t kJobs = 8;       // Three per frame: reconstruct, expand, deliver.
+// Copying a finished frame out reads only that picture, so it runs beside parsing
+// on the other core while this one reconstructs the next frame.
+constexpr BaseType_t kReaderCore = 1;
+constexpr uint32_t kReaderStackBytes = 4096;
 
 // One reconstruction, from the copy of the state that it needs.
 struct Stage {
@@ -30,13 +35,14 @@ struct Stage {
   int32_t iNotifyEvery;
   int32_t iResult;
 };
-enum JobKind : uint8_t { kJobRecon, kJobExpand, kJobWork, kJobDrain };
+enum JobKind : uint8_t { kJobRecon, kJobExpand, kJobWork, kJobReader, kJobDrain };
 struct Job {
   JobKind eKind;
   Stage* pStage;
   PWelsDecoderContext pCtx;
   PPicture pPicture;
   tab5_recon_work pWork;
+  const uint8_t* pPictureByte;   // kJobReader: a byte of the picture it reads.
   uint8_t uiPayload[TAB5_RECON_PAYLOAD_BYTES];
 };
 
@@ -51,6 +57,67 @@ SemaphoreHandle_t sDrained;
 std::atomic<bool> sFailed{false};
 int32_t sResult;
 bool sAllowed, sResultReady;
+
+// The reader runs one job at a time. hIdle is held from hand-over until it is done,
+// and pBusy names a byte of the picture it reads until then.
+struct Reader {
+  TaskHandle_t hTask;
+  SemaphoreHandle_t hIdle;
+  tab5_recon_work pWork;
+  uint8_t uiPayload[TAB5_RECON_PAYLOAD_BYTES];
+  std::atomic<const uint8_t*> pBusy{nullptr};
+} sReader;
+std::atomic<uint64_t> sReconUs{0}, sReaderUs{0}, sWaitUs{0};
+std::atomic<uint32_t> sWaits{0};
+
+void ReaderTask (void*) {
+  for (;;) {
+    ulTaskNotifyTake (pdTRUE, portMAX_DELAY);
+    const int64_t iStart = esp_timer_get_time();
+    sReader.pWork (sReader.uiPayload);
+    sReaderUs.fetch_add (uint64_t (esp_timer_get_time() - iStart), std::memory_order_relaxed);
+    sReader.pBusy.store (nullptr, std::memory_order_release);
+    xSemaphoreGive (sReader.hIdle);
+  }
+}
+
+// Worker side. Returns once the reader has finished whatever it was given.
+void WaitForReader() {
+  if (!sReader.hTask)
+    return;
+  const int64_t iStart = esp_timer_get_time();
+  xSemaphoreTake (sReader.hIdle, portMAX_DELAY);
+  xSemaphoreGive (sReader.hIdle);
+  sWaitUs.fetch_add (uint64_t (esp_timer_get_time() - iStart), std::memory_order_relaxed);
+}
+
+// Worker side, before writing into pPic: waits while the reader still reads it. A
+// picture whose extent is unknown counts as the one being read.
+void ProtectPicture (PPicture pPic) {
+  const uint8_t* pBusy = sReader.pBusy.load (std::memory_order_acquire);
+  if (!pBusy || !pPic)
+    return;
+  const uint8_t* pBegin = pPic->pData[0];
+  const int64_t iBytes = int64_t (pPic->iLinesize[0]) * pPic->iHeightInPixel;
+  if (pBegin && iBytes > 0 && (pBusy < pBegin || pBusy >= pBegin + iBytes))
+    return;
+  sWaits.fetch_add (1, std::memory_order_relaxed);
+  WaitForReader();
+}
+
+void StartReader (const Job& sJob) {
+  if (!sReader.hTask) {   // No helper: read here, as before.
+    sJob.pWork (sJob.uiPayload);
+    return;
+  }
+  const int64_t iStart = esp_timer_get_time();
+  xSemaphoreTake (sReader.hIdle, portMAX_DELAY);
+  sWaitUs.fetch_add (uint64_t (esp_timer_get_time() - iStart), std::memory_order_relaxed);
+  sReader.pWork = sJob.pWork;
+  memcpy (sReader.uiPayload, sJob.uiPayload, sizeof (sReader.uiPayload));
+  sReader.pBusy.store (sJob.pPictureByte, std::memory_order_release);
+  xTaskNotifyGive (sReader.hTask);
+}
 
 void RunStage (Stage& sStage) {
   sStage.iResult = ERR_NONE;
@@ -70,20 +137,35 @@ void ReconTask (void*) {
     xQueueReceive (sJobQueue, &sJob, portMAX_DELAY);
     const bool bSkip = sFailed.load (std::memory_order_relaxed);
     switch (sJob.eKind) {
-    case kJobRecon:
+    case kJobRecon: {
+      ProtectPicture (sJob.pStage->pContext->pDec);
+      ProtectPicture (sJob.pStage->pLayer->pDec);
+      const int64_t iStart = esp_timer_get_time();
       RunStage (*sJob.pStage);
+      sReconUs.fetch_add (uint64_t (esp_timer_get_time() - iStart), std::memory_order_relaxed);
       break;
+    }
     case kJobExpand:
-      if (!bSkip)
+      if (!bSkip) {
+        ProtectPicture (sJob.pPicture);
+        const int64_t iStart = esp_timer_get_time();
         ExpandReferencingPicture (sJob.pPicture->pData, sJob.pPicture->iWidthInPixel, sJob.pPicture->iHeightInPixel,
                                   sJob.pPicture->iLinesize, sJob.pCtx->sExpandPicFunc.pfExpandLumaPicture,
                                   sJob.pCtx->sExpandPicFunc.pfExpandChromaPicture);
+        sReconUs.fetch_add (uint64_t (esp_timer_get_time() - iStart), std::memory_order_relaxed);
+      }
       break;
     case kJobWork:
       if (!bSkip)
         sJob.pWork (sJob.uiPayload);
       break;
+    case kJobReader:
+      if (!bSkip)
+        StartReader (sJob);
+      break;
     case kJobDrain:
+      // The parsing side may free or rewrite any picture once this returns.
+      WaitForReader();
       xSemaphoreGive (sDrained);
       break;
     }
@@ -112,6 +194,16 @@ bool EnsureWorker() {
     sJobQueue = xQueueCreate (kJobs, sizeof (Job));
   if (!sDrained || !sJobQueue)
     return false;
+  // Optional: without the helper, readers run on the worker as before.
+  if (!sReader.hIdle) {
+    sReader.hIdle = xSemaphoreCreateBinary();
+    if (sReader.hIdle) {
+      xSemaphoreGive (sReader.hIdle);
+      if (xTaskCreatePinnedToCore (ReaderTask, "h264_reader", kReaderStackBytes, nullptr, kPriority, &sReader.hTask,
+                                   kReaderCore) != pdPASS)
+        sReader.hTask = nullptr;
+    }
+  }
   return xTaskCreatePinnedToCore (ReconTask, "h264_recon", kStackBytes, nullptr, kPriority, &sTask, kCore) == pdPASS;
 }
 
@@ -286,6 +378,29 @@ bool tab5_recon_post (tab5_recon_work pWork, const void* pPayload, size_t uiByte
   memcpy (sJob.uiPayload, pPayload, uiBytes);
   Post (sJob);
   return true;
+}
+
+bool tab5_recon_post_reader (tab5_recon_work pWork, const void* pPayload, size_t uiBytes, const void* pPictureByte) {
+  using namespace WelsDec;
+  if (uiBytes > TAB5_RECON_PAYLOAD_BYTES || !pPictureByte || !EnsureWorker())
+    return false;
+  Job sJob = {};
+  sJob.eKind = kJobReader;
+  sJob.pWork = pWork;
+  sJob.pPictureByte = static_cast<const uint8_t*> (pPictureByte);
+  memcpy (sJob.uiPayload, pPayload, uiBytes);
+  Post (sJob);
+  return true;
+}
+
+void tab5_recon_get_stats (tab5_recon_stats_t* pStats) {
+  using namespace WelsDec;
+  if (!pStats)
+    return;
+  pStats->recon_us = sReconUs.load (std::memory_order_relaxed);
+  pStats->reader_us = sReaderUs.load (std::memory_order_relaxed);
+  pStats->wait_us = sWaitUs.load (std::memory_order_relaxed);
+  pStats->waits = sWaits.load (std::memory_order_relaxed);
 }
 
 void tab5_recon_drain (void) {
