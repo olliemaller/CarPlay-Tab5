@@ -155,6 +155,7 @@ void worker(void *) {
     cp_decoder *decoder=nullptr; uint64_t decoder_revision=0;
     for(;;) {
         ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(200));
+        int64_t busy_since=esp_timer_get_time();
         log_stats();
         for(;;) {
             cp_video_unit unit; uint64_t current,version;
@@ -188,7 +189,10 @@ void worker(void *) {
                 cp_video_reset(&queue,generation); ++revision;
             }
             xSemaphoreGive(mutex);
-            taskYIELD();
+            // At the higher frame rates this core can stay busy for seconds. Rest
+            // one tick now and then, so the idle task (and its watchdog) can run.
+            if(esp_timer_get_time()-busy_since>250000) { vTaskDelay(1); busy_since=esp_timer_get_time(); }
+            else taskYIELD();
         }
     }
 }
