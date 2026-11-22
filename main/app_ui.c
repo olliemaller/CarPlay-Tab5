@@ -50,8 +50,11 @@ static void *sink_context;
 #define VOLUME_DEFAULT 30
 #define BRIGHTNESS_DEFAULT 40
 #define BRIGHTNESS_MIN 10
-static lv_obj_t *settings,*volume_value,*brightness_value;
+static lv_obj_t *settings,*volume_value,*brightness_value,*settings_battery;
 static bool settings_open;
+/* Written under the LVGL lock, read by the video presenter for the overlay. */
+static volatile int battery_percent=-1;
+static volatile bool battery_charging,battery_low,shutting_down,right_hand_ui;
 /* The BSP keeps its panel handle private; bsp_display_start() is its only caller. */
 lv_display_t *__real_lvgl_port_add_disp_dsi(const lvgl_port_display_cfg_t *,const lvgl_port_display_dsi_cfg_t *);
 lv_display_t *__wrap_lvgl_port_add_disp_dsi(const lvgl_port_display_cfg_t *config,const lvgl_port_display_dsi_cfg_t *dsi)
@@ -261,6 +264,7 @@ static void drive_event(lv_event_t *event)
     if(lv_event_get_code(event)!=LV_EVENT_VALUE_CHANGED) return;
     const bool right=lv_obj_has_state(lv_event_get_target(event),LV_STATE_CHECKED);
     airplay_software_provider_set_right_hand_drive(right);
+    right_hand_ui=right;
     save_setting("rhd",right?1:0);
 }
 static void drive_row(lv_obj_t *parent,int y,bool right)
@@ -345,6 +349,10 @@ static void build_settings(lv_obj_t *screen,int volume,int brightness,bool right
     lv_obj_set_style_text_color(heading,lv_color_hex(UI_ACCENT),0);
     lv_obj_set_style_text_font(heading,&lv_font_montserrat_40,0);
     lv_obj_set_pos(heading,96,64);
+    settings_battery=lv_label_create(settings); lv_label_set_text(settings_battery,"");
+    lv_obj_set_style_text_color(settings_battery,lv_color_hex(UI_MUTED),0);
+    lv_obj_set_style_text_font(settings_battery,&lv_font_montserrat_28,0);
+    lv_obj_align(settings_battery,LV_ALIGN_TOP_RIGHT,-96,76);
     settings_row(settings,"Volume",200,volume,0,&volume_value,true);
     settings_row(settings,"Brightness",340,brightness,BRIGHTNESS_MIN,&brightness_value,false);
     drive_row(settings,470,right_hand);
@@ -398,6 +406,7 @@ esp_err_t tab5_ui_init(void)
     const int volume=load_setting("volume",VOLUME_DEFAULT,0,100);
     const int brightness=load_setting("brightness",BRIGHTNESS_DEFAULT,BRIGHTNESS_MIN,100);
     const bool right_hand=load_setting("rhd",0,0,1)!=0;
+    right_hand_ui=right_hand;
     tab5_audio_set_volume(volume);
     airplay_software_provider_set_right_hand_drive(right_hand);
     build_settings(screen,volume,brightness,right_hand);
@@ -446,7 +455,7 @@ static void clear_framebuffers(void)
 }
 void tab5_ui_status(cp_stage stage,cp_error error)
 {
-    if(!ready || !bsp_display_lock(1000)) return;
+    if(!ready || shutting_down || !bsp_display_lock(1000)) return;
     ui_stage=stage;
     const char *hint="Preparing the connection.";
     switch(stage) {
@@ -479,6 +488,29 @@ void tab5_ui_status(cp_stage stage,cp_error error)
     pair_refresh();
     bsp_display_unlock();
 }
+/* A small battery in the top corner away from the CarPlay dock, drawn into the
+ * panel frame buffer the PPA has just filled. The PPA invalidated that buffer in
+ * the cache before writing it, so only the rows drawn here need writing back.
+ * Landscape (x,y) is panel (y,width-1-x), as the rotation below. */
+static void draw_low_battery(void *framebuffer,int percent)
+{
+    enum { W=60, H=30, NUB=6, PAD=8, MARGIN=24, LINE=3 };
+    const uint16_t red=0xf904,dark=0x10c4;   /* RGB565 warning red and UI_BG */
+    uint16_t *fb=framebuffer;
+    const int x0=right_hand_ui?MARGIN+PAD:width-MARGIN-PAD-W-NUB,y0=MARGIN+PAD;
+    const int fill=(percent<0?0:percent>100?100:percent)*(W-4*LINE)/100;
+    for(int x=x0-PAD;x<x0+W+NUB+PAD;++x) for(int y=y0-PAD;y<y0+H+PAD;++y) {
+        const int dx=x-x0,dy=y-y0;
+        const bool body=dx>=0 && dx<W && dy>=0 && dy<H;
+        const bool outline=body && (dx<LINE || dx>=W-LINE || dy<LINE || dy>=H-LINE);
+        const bool nub=dx>=W && dx<W+NUB && dy>=H/3 && dy<H-H/3;
+        const bool level=body && dx>=2*LINE && dx<2*LINE+(fill<LINE?LINE:fill) && dy>=2*LINE && dy<H-2*LINE;
+        fb[(size_t)(width-1-x)*height+y]=outline||nub||level?red:dark;
+    }
+    const int first=width-(x0+W+NUB+PAD),last=width-1-(x0-PAD);
+    esp_cache_msync(fb+(size_t)first*height,(size_t)(last-first+1)*height*2,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M|ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+}
 bool tab5_ui_frame(const uint8_t *data,unsigned frame_width,unsigned frame_height)
 {
     if(!ready || !data || !bsp_display_lock(1000)) return false;
@@ -488,7 +520,7 @@ bool tab5_ui_frame(const uint8_t *data,unsigned frame_width,unsigned frame_heigh
         const carplay_video_profile_t *profile=carplay_video_profile_current();
         if(!cp_touch_configure(&touch,width,height,frame_width,frame_height,profile->aspect_width,profile->aspect_height)) { bsp_display_unlock(); return false; }
     }
-    if(settings_open || pair_dialog_open || pair_busy) { bsp_display_unlock(); return true; }
+    if(settings_open || pair_dialog_open || pair_busy || shutting_down) { bsp_display_unlock(); return true; }
     const bool entering=!video_visible;
     enter_video();
     const cp_touch area=touch;
@@ -507,6 +539,7 @@ bool tab5_ui_frame(const uint8_t *data,unsigned frame_width,unsigned frame_heigh
     };
     esp_err_t e=ppa_do_scale_rotate_mirror(scaler,&operation);
     if(e!=ESP_OK) { ESP_LOGE("VIDEO","PPA failed: %s",esp_err_to_name(e)); return false; }
+    if(battery_low && !battery_charging) draw_low_battery(framebuffers[hidden_buffer],battery_percent);
     if(!bsp_display_lock(1000)) return false;
     /* A status change may have returned the screen to LVGL during the PPA pass. */
     if(video_visible) {
@@ -514,6 +547,36 @@ bool tab5_ui_frame(const uint8_t *data,unsigned frame_width,unsigned frame_heigh
         if(e==ESP_OK) hidden_buffer^=1;
     }
     bsp_display_unlock(); return e==ESP_OK;
+}
+void tab5_ui_battery(int percent,bool charging,bool low)
+{
+    if(!ready || !bsp_display_lock(1000)) return;
+    battery_percent=percent; battery_charging=charging; battery_low=low;
+    char text[64];
+    const char *version=esp_app_get_description()->version;
+    if(percent<0) { snprintf(text,sizeof(text),"v%s",version); lv_label_set_text(settings_battery,""); }
+    else {
+        snprintf(text,sizeof(text),"v%s  |  %s %d%%",version,charging?"Charging":"Battery",percent);
+        lv_label_set_text_fmt(settings_battery,"%s %d%%",charging?"Charging":"Battery",percent);
+        lv_obj_set_style_text_color(settings_battery,lv_color_hex(low && !charging?UI_ERROR:UI_MUTED),0);
+    }
+    lv_label_set_text(mode,text);
+    lv_obj_set_style_text_color(mode,lv_color_hex(low && !charging?UI_ERROR:UI_MUTED),0);
+    bsp_display_unlock();
+}
+void tab5_ui_power_off_notice(void)
+{
+    if(!ready || !bsp_display_lock(1000)) return;
+    shutting_down=true;
+    deliver(cp_touch_cancel(&touch)); memset(&touch,0,sizeof(touch));
+    if(settings_open) { settings_open=false; lv_obj_add_flag(settings,LV_OBJ_FLAG_HIDDEN); }
+    pair_close(); lv_obj_add_flag(pair_button,LV_OBJ_FLAG_HIDDEN);
+    leave_video();
+    lv_obj_remove_flag(brand,LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(title,"Battery empty");
+    lv_label_set_text(detail,"Tab5 is turning off to protect the battery. Charge it over USB-C.");
+    lv_obj_set_style_text_color(detail,lv_color_hex(UI_ERROR),0);
+    bsp_display_unlock();
 }
 void tab5_ui_clear(void)
 {

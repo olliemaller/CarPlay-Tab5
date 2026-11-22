@@ -8,6 +8,7 @@ idf_component_register(
         "core/audio_resample.c"
         "core/video_queue.c"
         "core/touch.c"
+        "core/battery.c"
         "core/rtsp_stream.c"
         "app_main.c"
         "sd_log.c"

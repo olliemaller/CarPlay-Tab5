@@ -144,6 +144,23 @@ int main(void) {
     lv_obj_t *toggle=find_switch(screen);assert(toggle);
     lv_obj_add_state(toggle,LV_STATE_CHECKED);lv_obj_send_event(toggle,LV_EVENT_VALUE_CHANGED,NULL);tick(120);
     assert(right_hand_value==1);
+    tab5_ui_battery(72,true,false);tick(120);
+    assert(find_text(screen,"Charging 72%"));
     save("artifacts/ui-settings.ppm");
-    puts("Production LVGL UI: cancel, unplug/drain gate, repeat, progress, errors and streaming visibility, drive side passed");
+    click(button(screen,LV_SYMBOL_LEFT "  Back to CarPlay"));
+    /* Low battery: the waiting screen says so, and a small icon is drawn over the
+     * video on the side away from the dock (left, as right-hand drive is now on). */
+    tab5_ui_battery(9,false,true);tick(120);
+    assert(find_text(screen,"v1.0.0  |  Battery 9%"));
+    static uint8_t packed[890*240*3/2];
+    assert(tab5_ui_frame(packed,890,240));
+    assert(panel_b[(1280-1-32)*720+32]==0xf904);            /* Icon outline, top-left. */
+    assert(panel_b[(1280-1-1200)*720+32]!=0xf904);          /* Not on the right. */
+    /* Power-off notice: video stops, status updates no longer replace the text. */
+    tab5_ui_power_off_notice();tick(120);
+    assert(find_text(screen,"Battery empty"));
+    tab5_ui_status(CP_STREAMING,CP_ERR_NONE);
+    assert(find_text(screen,"Battery empty"));
+    save("artifacts/ui-power-off.ppm");
+    puts("Production LVGL UI: cancel, unplug/drain gate, repeat, progress, errors and streaming visibility, drive side, battery and power-off passed");
 }
