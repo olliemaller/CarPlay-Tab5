@@ -50,19 +50,38 @@ static bool rate_supported(uint32_t rate)
     return rate == 8000 || rate == 16000 || rate == 24000 || rate == 32000 || rate == 48000;
 }
 
+/* esp_codec_dev disables each I2S channel before configuring it, and the driver
+ * logs an error when that channel was never enabled, as on every first open. The
+ * failure it reports is ignored by esp_codec_dev, so only that log is hidden; the
+ * opens below still report their own result. */
+static esp_log_level_t quiet_i2s(void)
+{
+    const esp_log_level_t previous = esp_log_level_get("i2s_common");
+    esp_log_level_set("i2s_common", ESP_LOG_NONE);
+    return previous;
+}
+
 static esp_err_t open_codecs(void)
 {
     if (!speaker) speaker = bsp_audio_codec_speaker_init();
     if (!microphone) microphone = bsp_audio_codec_microphone_init();
     esp_codec_dev_sample_info_t fmt = {.sample_rate = CP_AUDIO_RATE, .channel = 2, .bits_per_sample = 16};
-    if (!speaker || !microphone || esp_codec_dev_open(speaker, &fmt) != ESP_CODEC_DEV_OK) {
+    const esp_log_level_t i2s_level = quiet_i2s();
+    const bool speaker_open = speaker && microphone && esp_codec_dev_open(speaker, &fmt) == ESP_CODEC_DEV_OK;
+    esp_log_level_set("i2s_common", i2s_level);
+    if (!speaker_open) {
         ESP_LOGE(TAG, "speaker open failed");
         return ESP_FAIL;
     }
     applied_volume = volume;
-    if (esp_codec_dev_set_out_vol(speaker, applied_volume) != ESP_CODEC_DEV_OK ||
-        esp_codec_dev_set_out_mute(speaker, false) != ESP_CODEC_DEV_OK ||
-        esp_codec_dev_open(microphone, &fmt) != ESP_CODEC_DEV_OK) {
+    bool ready = esp_codec_dev_set_out_vol(speaker, applied_volume) == ESP_CODEC_DEV_OK &&
+                 esp_codec_dev_set_out_mute(speaker, false) == ESP_CODEC_DEV_OK;
+    if (ready) {
+        quiet_i2s();
+        ready = esp_codec_dev_open(microphone, &fmt) == ESP_CODEC_DEV_OK;
+        esp_log_level_set("i2s_common", i2s_level);
+    }
+    if (!ready) {
         ESP_LOGE(TAG, "volume, unmute or microphone open failed");
         esp_codec_dev_close(speaker);
         return ESP_FAIL;
