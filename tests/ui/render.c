@@ -60,6 +60,8 @@ void nvs_close(nvs_handle_t h) { (void)h; }
 void tab5_audio_set_volume(int v) { (void)v; }
 bool airplay_host_ui_take(void) { bool v=settings_requested;settings_requested=false;return v; }
 void airplay_control_port_request_main_screen_keyframe(void) {}
+static int right_hand_calls,right_hand_value=-1;
+void airplay_software_provider_set_right_hand_drive(bool right) { ++right_hand_calls; right_hand_value=right; }
 int64_t esp_timer_get_time(void) { return clock_us; }
 bool tab5_pair_reset_ready(void) { return reset_ready; }
 tab5_pair_reset_state tab5_pair_reset_status(void) { return reset_state; }
@@ -88,8 +90,17 @@ static lv_obj_t *button(lv_obj_t *root,const char *text) {
     lv_obj_t *label=find_text(root,text);assert(label);return lv_obj_get_parent(label);
 }
 static void click(lv_obj_t *b) { assert(!lv_obj_has_state(b,LV_STATE_DISABLED));lv_obj_send_event(b,LV_EVENT_CLICKED,NULL);tick(120); }
+static lv_obj_t *find_switch(lv_obj_t *parent) {
+    for(uint32_t i=0;i<lv_obj_get_child_count(parent);++i) {
+        lv_obj_t *child=lv_obj_get_child(parent,(int32_t)i);
+        if(lv_obj_check_type(child,&lv_switch_class)) return child;
+        lv_obj_t *found=find_switch(child); if(found) return found;
+    }
+    return NULL;
+}
 int main(void) {
     assert(tab5_ui_init()==ESP_OK);tick(120);
+    assert(right_hand_calls==1 && right_hand_value==0); /* Default left-hand drive applied at start. */
     lv_obj_t *screen=lv_screen_active(),*entry=button(screen,"Clear pairing");
     save("artifacts/ui-disconnected.ppm");
     click(entry);
@@ -127,5 +138,12 @@ int main(void) {
     tab5_ui_status(CP_DETACHED,CP_ERR_NONE);click(entry);
     tab5_ui_status(CP_STREAMING,CP_ERR_NONE);
     assert(lv_obj_has_flag(overlay,LV_OBJ_FLAG_HIDDEN) && lv_obj_has_flag(entry,LV_OBJ_FLAG_HIDDEN));
-    puts("Production LVGL UI: cancel, unplug/drain gate, repeat, progress, errors and streaming visibility passed");
+    /* Settings page from CarPlay: the drive-side switch reaches the provider. */
+    settings_requested=true;tick(200);
+    assert(find_text(screen,"Right-hand drive"));
+    lv_obj_t *toggle=find_switch(screen);assert(toggle);
+    lv_obj_add_state(toggle,LV_STATE_CHECKED);lv_obj_send_event(toggle,LV_EVENT_VALUE_CHANGED,NULL);tick(120);
+    assert(right_hand_value==1);
+    save("artifacts/ui-settings.ppm");
+    puts("Production LVGL UI: cancel, unplug/drain gate, repeat, progress, errors and streaming visibility, drive side passed");
 }

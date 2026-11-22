@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "airplay_host_ui.h"
+#include "airplay_software_provider.h"
 #include "airplay_control_port.h"
 #include "audio_output.h"
 #include "pairing_reset.h"
@@ -253,6 +254,31 @@ static void slider_event(lv_event_t *event)
         save_setting(is_volume?"volume":"brightness",value);   /* flash once per drag */
     }
 }
+/* Right-hand drive moves the CarPlay dock to the right. The phone reads it when
+ * a session starts, so it applies from the next connection. */
+static void drive_event(lv_event_t *event)
+{
+    if(lv_event_get_code(event)!=LV_EVENT_VALUE_CHANGED) return;
+    const bool right=lv_obj_has_state(lv_event_get_target(event),LV_STATE_CHECKED);
+    airplay_software_provider_set_right_hand_drive(right);
+    save_setting("rhd",right?1:0);
+}
+static void drive_row(lv_obj_t *parent,int y,bool right)
+{
+    lv_obj_t *caption=lv_label_create(parent); lv_label_set_text(caption,"Right-hand drive");
+    lv_obj_set_style_text_color(caption,lv_color_hex(UI_TEXT),0);
+    lv_obj_set_style_text_font(caption,&lv_font_montserrat_28,0);
+    lv_obj_set_pos(caption,96,y);
+    lv_obj_t *note=lv_label_create(parent); lv_label_set_text(note,"Dock on the right. Applies from the next connection.");
+    lv_obj_set_style_text_color(note,lv_color_hex(UI_MUTED),0);
+    lv_obj_set_pos(note,96,y+40);
+    lv_obj_t *toggle=lv_switch_create(parent);
+    lv_obj_set_size(toggle,96,48); lv_obj_align(toggle,LV_ALIGN_TOP_RIGHT,-96,y);
+    lv_obj_set_ext_click_area(toggle,24);
+    lv_obj_set_style_bg_color(toggle,lv_color_hex(UI_ACCENT),LV_PART_INDICATOR|LV_STATE_CHECKED);
+    if(right) lv_obj_add_state(toggle,LV_STATE_CHECKED);
+    lv_obj_add_event_cb(toggle,drive_event,LV_EVENT_VALUE_CHANGED,NULL);
+}
 static void leave_video(void);
 static void close_settings(void)
 {
@@ -306,7 +332,7 @@ static lv_obj_t *settings_row(lv_obj_t *parent,const char *name,int y,int value,
     lv_obj_add_event_cb(slider,slider_event,LV_EVENT_RELEASED,is_volume?(void *)1:NULL);
     return slider;
 }
-static void build_settings(lv_obj_t *screen,int volume,int brightness)
+static void build_settings(lv_obj_t *screen,int volume,int brightness,bool right_hand)
 {
     settings=lv_obj_create(screen);
     lv_obj_remove_style_all(settings);
@@ -320,7 +346,8 @@ static void build_settings(lv_obj_t *screen,int volume,int brightness)
     lv_obj_set_style_text_font(heading,&lv_font_montserrat_40,0);
     lv_obj_set_pos(heading,96,64);
     settings_row(settings,"Volume",200,volume,0,&volume_value,true);
-    settings_row(settings,"Brightness",360,brightness,BRIGHTNESS_MIN,&brightness_value,false);
+    settings_row(settings,"Brightness",340,brightness,BRIGHTNESS_MIN,&brightness_value,false);
+    drive_row(settings,470,right_hand);
     lv_obj_t *back=lv_button_create(settings);
     lv_obj_set_size(back,360,88); lv_obj_align(back,LV_ALIGN_BOTTOM_MID,0,-64);
     lv_obj_set_style_bg_color(back,lv_color_hex(UI_ACCENT),0);
@@ -370,12 +397,14 @@ esp_err_t tab5_ui_init(void)
     (void)nvs_flash_init();
     const int volume=load_setting("volume",VOLUME_DEFAULT,0,100);
     const int brightness=load_setting("brightness",BRIGHTNESS_DEFAULT,BRIGHTNESS_MIN,100);
+    const bool right_hand=load_setting("rhd",0,0,1)!=0;
     tab5_audio_set_volume(volume);
-    build_settings(screen,volume,brightness);
+    airplay_software_provider_set_right_hand_drive(right_hand);
+    build_settings(screen,volume,brightness,right_hand);
     build_pairing(screen);
     lv_timer_create(settings_timer,100,NULL);
     lv_timer_create(pairing_timer,100,NULL);
-    ESP_LOGI("SETTINGS","volume=%d brightness=%d",volume,brightness);
+    ESP_LOGI("SETTINGS","volume=%d brightness=%d right_hand_drive=%d",volume,brightness,right_hand);
     ready=true;
     bsp_display_unlock(); return bsp_display_brightness_set(brightness);
 }
