@@ -318,11 +318,33 @@ const char *tls_state_name(int state) {
     }
 }
 
+// The host key, parsed once and kept. Each RSA signature needs blinding values;
+// mbedTLS derives them with a slow software inverse the first time a key context
+// signs, then reuses them, so keeping the context speeds up every later handshake
+// (the CarKit one after Lockdown, and every reconnect). Only the Lockdown worker
+// runs handshakes, one at a time.
+class HostKeyCache {
+    mbedtls_pk_context key;
+    uint8_t digest[32]={};
+    bool ready=false;
+public:
+    HostKeyCache() { mbedtls_pk_init(&key); }
+    mbedtls_pk_context *get(const char *pem) {
+        uint8_t hash[32];
+        if (mbedtls_sha256(reinterpret_cast<const uint8_t *>(pem),strlen(pem),hash,0)) return nullptr;
+        if (ready && !memcmp(hash,digest,sizeof(hash))) return &key;
+        mbedtls_pk_free(&key); mbedtls_pk_init(&key); ready=false;
+        if (mbedtls_pk_parse_key(&key,reinterpret_cast<const uint8_t *>(pem),strlen(pem)+1,nullptr,0,random_bytes,nullptr)) return nullptr;
+        memcpy(digest,hash,sizeof(hash)); ready=true;
+        return &key;
+    }
+};
+HostKeyCache host_key_cache;
+
 class TlsStream final : public Stream {
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config config;
     mbedtls_x509_crt cert;
-    mbedtls_pk_context key;
     uint8_t expected_key[32];
     static int send_cb(void *ctx,const uint8_t *data,size_t size) {
         auto *self=static_cast<TlsStream *>(ctx);
@@ -346,10 +368,10 @@ class TlsStream final : public Stream {
     }
 public:
     explicit TlsStream(uint32_t id):Stream(id) {
-        mbedtls_ssl_init(&ssl); mbedtls_ssl_config_init(&config); mbedtls_x509_crt_init(&cert); mbedtls_pk_init(&key);
+        mbedtls_ssl_init(&ssl); mbedtls_ssl_config_init(&config); mbedtls_x509_crt_init(&cert);
     }
     ~TlsStream() override {
-        mbedtls_ssl_free(&ssl); mbedtls_ssl_config_free(&config); mbedtls_x509_crt_free(&cert); mbedtls_pk_free(&key);
+        mbedtls_ssl_free(&ssl); mbedtls_ssl_config_free(&config); mbedtls_x509_crt_free(&cert);
     }
     bool start(const PairRecord &r,const char *name) {
         uint32_t failures_before=alloc_failure_count();
@@ -359,7 +381,8 @@ public:
         log_tls_heap(name,"begin");
         memcpy(expected_key,r.phone_key_hash,32);
         int rc=mbedtls_x509_crt_parse(&cert,reinterpret_cast<const uint8_t *>(r.root_cert),strlen(r.root_cert)+1);
-        if (!rc) rc=mbedtls_pk_parse_key(&key,reinterpret_cast<const uint8_t *>(r.root_key),strlen(r.root_key)+1,nullptr,0,random_bytes,nullptr);
+        mbedtls_pk_context *key=rc?nullptr:host_key_cache.get(r.root_key);
+        if (!rc && !key) rc=MBEDTLS_ERR_PK_KEY_INVALID_FORMAT;
         if (!rc) rc=mbedtls_ssl_config_defaults(&config,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT);
         if (rc) { ESP_LOGE(tag,"TLS configuration failed: -0x%x",-rc); return false; }
         mbedtls_ssl_conf_rng(&config,random_bytes,nullptr);
@@ -368,7 +391,7 @@ public:
         mbedtls_ssl_conf_verify(&config,verify_cb,this);
         mbedtls_ssl_conf_min_tls_version(&config,MBEDTLS_SSL_VERSION_TLS1_2);
         mbedtls_ssl_conf_max_tls_version(&config,MBEDTLS_SSL_VERSION_TLS1_2);
-        rc=mbedtls_ssl_conf_own_cert(&config,&cert,&key);
+        rc=mbedtls_ssl_conf_own_cert(&config,&cert,key);
         if (!rc) rc=mbedtls_ssl_setup(&ssl,&config);
         // mbedTLS 3.6 requires an explicit peer name with VERIFY_REQUIRED.
         // This USB-only connection still authenticates the pinned phone key in
